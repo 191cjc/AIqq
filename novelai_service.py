@@ -21,16 +21,12 @@ NOVELAI_HEIGHT = 1024
 NOVELAI_STEPS = 28
 NOVELAI_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 SAFE_PROMPT_PREFIX = "rating:general, safe, sfw"
-QUALITY_PROMPT_SUFFIX = (
-    "best quality, amazing quality, highres, absurdres, finely detailed, "
-    "intricate details, sharp focus"
-)
 SAFE_NEGATIVE_PROMPT = (
+    # Adult-content safeguards are always applied and cannot be overridden by users.
     "nsfw, explicit, nude, naked, nipples, areolae, genitals, sex, "
     "sexual_intercourse, masturbation, sexual_fluids, erotic, suggestive, "
     "fetish, lingerie, underwear, see-through_clothes, cleavage, loli, shota, "
-    "lowres, blurry, bad anatomy, bad hands, extra digits, fewer digits, "
-    "text, watermark, logo, jpeg artifacts"
+    "child sexualization"
 )
 
 
@@ -293,15 +289,13 @@ class NovelAIService:
             raise NovelAIError("NovelAI MCP 尚未完成能力检查。")
 
         arguments: dict[str, Any] = {
-            "prompt": (
-                f"{SAFE_PROMPT_PREFIX}, {prompt}, {QUALITY_PROMPT_SUFFIX}"
-            ),
+            "prompt": f"{SAFE_PROMPT_PREFIX}, {prompt}",
             "negative_prompt": SAFE_NEGATIVE_PROMPT,
             "model": NOVELAI_MODEL,
             "width": NOVELAI_WIDTH,
             "height": NOVELAI_HEIGHT,
             "seed": None,
-            "quality_toggle": True,
+            "quality_toggle": False,
             "variety_boost": True,
         }
         if self._supports_steps:

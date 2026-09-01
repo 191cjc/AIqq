@@ -3,8 +3,12 @@ import unittest
 from panel_service import (
     CLEAR_MEMORY_COMMAND,
     CLEAR_MEMORY_DESCRIPTION,
+    MENU_COMMAND,
+    MENU_DESCRIPTION,
     NOVELAI_IMAGE_COMMAND,
     NOVELAI_IMAGE_DESCRIPTION,
+    NOVELAI_PROMPT_COMMAND,
+    NOVELAI_PROMPT_DESCRIPTION,
     PANEL_REMARK,
     PanelService,
 )
@@ -48,6 +52,24 @@ def image_command_item():
     }
 
 
+def prompt_command_item():
+    return {
+        "type": "command",
+        "name": NOVELAI_PROMPT_COMMAND,
+        "desc": NOVELAI_PROMPT_DESCRIPTION,
+        "only_admin": False,
+    }
+
+
+def menu_command_item():
+    return {
+        "type": "command",
+        "name": MENU_COMMAND,
+        "desc": MENU_DESCRIPTION,
+        "only_admin": False,
+    }
+
+
 class PanelServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_creates_global_group_panel_when_missing(self):
         http = FakeHttp({"records": []}, {"panel_id": "panel-new"})
@@ -67,7 +89,12 @@ class PanelServiceTests(unittest.IsolatedAsyncioTestCase):
                     "scope": "group",
                     "target_type": "all",
                     "panel": {
-                        "items": [command_item(), image_command_item()],
+                        "items": [
+                            menu_command_item(),
+                            command_item(),
+                            prompt_command_item(),
+                            image_command_item(),
+                        ],
                         "remark": PANEL_REMARK,
                     },
                 },
@@ -82,7 +109,12 @@ class PanelServiceTests(unittest.IsolatedAsyncioTestCase):
                         "panel_id": "panel-existing",
                         "target_type": "all",
                         "panel": {
-                            "items": [command_item(), image_command_item()],
+                            "items": [
+                                menu_command_item(),
+                                command_item(),
+                                prompt_command_item(),
+                                image_command_item(),
+                            ],
                             "remark": PANEL_REMARK,
                         },
                     }
@@ -119,7 +151,12 @@ class PanelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(http.calls[1]["parameters"], {"panel_id": "panel-old"})
         self.assertEqual(
             http.calls[1]["json"]["panel"]["items"],
-            [command_item(), image_command_item()],
+            [
+                menu_command_item(),
+                command_item(),
+                prompt_command_item(),
+                image_command_item(),
+            ],
         )
 
     async def test_reuses_command_in_another_global_panel(self):
@@ -150,7 +187,13 @@ class PanelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             http.calls[1]["json"]["panel"],
             {
-                "items": [weather, command_item(), image_command_item()],
+                "items": [
+                    weather,
+                    command_item(),
+                    menu_command_item(),
+                    prompt_command_item(),
+                    image_command_item(),
+                ],
                 "remark": "已有面板",
             },
         )

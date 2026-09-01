@@ -3,3 +3,4 @@ python-dotenv>=1.0,<2
 aiohttp>=3.9,<4
 openai>=1.68,<2
 aiosqlite>=0.20,<1
+mistune>=3.0,<4

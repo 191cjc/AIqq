@@ -9,7 +9,7 @@ import aiosqlite
 from ai_service import env_int
 
 
-MAX_IMAGE_PROMPT_CHARS = 800
+MAX_IMAGE_PROMPT_CHARS = 2000
 
 
 @dataclass(frozen=True)

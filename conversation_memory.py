@@ -229,6 +229,20 @@ class ConversationManager:
         async with lock:
             await self.memory.clear(conversation_key)
 
+    async def load_context(self, conversation_key: str) -> ConversationContext:
+        lock = await self._get_lock(conversation_key)
+        async with lock:
+            return await self.memory.load_context(conversation_key)
+
+    async def record_round(
+        self, conversation_key: str, user_content: str, assistant_content: str
+    ) -> None:
+        lock = await self._get_lock(conversation_key)
+        async with lock:
+            await self.memory.append_round(
+                conversation_key, user_content, assistant_content
+            )
+
     async def _get_lock(self, conversation_key: str) -> asyncio.Lock:
         async with self._locks_guard:
             return self._locks.setdefault(conversation_key, asyncio.Lock())

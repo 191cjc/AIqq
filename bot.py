@@ -7,19 +7,140 @@ from botpy import logging
 from botpy.message import C2CMessage, GroupMessage
 from dotenv import load_dotenv
 
-from ai_service import AIResult, AIService, clean_prompt, env_int
-from commands import MEMORY_CLEAR_COMMANDS, NOVELAI_IMAGE_COMMAND, extract_novelai_prompt
+from ai_service import (
+    AIResult,
+    AIService,
+    SAFE_IMAGE_PROMPT_FALLBACK,
+    clean_prompt,
+    env_int,
+    normalize_reply_summary,
+)
+from commands import (
+    MEMORY_CLEAR_COMMANDS,
+    NOVELAI_IMAGE_COMMAND,
+    NOVELAI_PROMPT_COMMAND,
+    NOVELAI_PROMPT_EDIT_COMMAND,
+    extract_menu_suggestion,
+    extract_novelai_prompt,
+    extract_novelai_prompt_edit_request,
+    extract_novelai_prompt_request,
+)
 from conversation_memory import ConversationManager, ConversationMemory
 from image_generation import ImageUsageStore, MAX_IMAGE_PROMPT_CHARS
 from media_store import TemporaryMediaStore
-from message_ui import reply_research_stage, reply_with_clear_memory_button
+from message_ui import (
+    reply_feature_menu,
+    reply_research_stage,
+    reply_with_novelai_prompt_options,
+    reply_with_quick_menu,
+)
 from novelai_service import NovelAIError, NovelAIService
 from panel_service import PanelService
+from prompt_sessions import PromptSessionStore
 from qq_media_service import QQMediaError, upload_qq_image
+from reply_store import TemporaryReplyStore
 
 
 load_dotenv()
 logger = logging.get_logger()
+MAX_RESEARCH_STAGE_REPLIES = 2
+REPLY_SUMMARY_TIMEOUT_SECONDS = env_int(
+    "AIQQ_REPLY_SUMMARY_TIMEOUT_SECONDS", 30, 5, 60
+)
+
+
+def format_novelai_prompt_options(prompts: tuple[str, ...]) -> str:
+    sections = ["可选择以下 NovelAI 提示词方案："]
+    sections.extend(
+        f"方案{index}：\n{prompt}" for index, prompt in enumerate(prompts, 1)
+    )
+    return "\n\n".join(sections)
+
+
+async def prepare_text_reply(bot, content: str) -> tuple[str, str | None]:
+    full_reply_url = None
+    reply_store = getattr(bot, "reply_store", None)
+    if reply_store is not None:
+        try:
+            export = await asyncio.to_thread(reply_store.save, content)
+            full_reply_url = export.public_url
+        except Exception as error:
+            logger.exception("保存完整回复失败：%s", error)
+
+    try:
+        async with asyncio.timeout(REPLY_SUMMARY_TIMEOUT_SECONDS):
+            display_text = normalize_reply_summary(
+                await bot.ai.summarize_reply(content)
+            )
+    except Exception as error:
+        logger.warning("生成回复摘要失败，使用本地摘要：%s", error)
+        display_text = normalize_reply_summary(content)
+    return display_text, full_reply_url
+
+
+async def send_text_reply(bot, message, content: str, **kwargs):
+    display_text, full_reply_url = await prepare_text_reply(bot, content)
+    return await reply_with_quick_menu(
+        message,
+        display_text,
+        full_reply_url=full_reply_url,
+        **kwargs,
+    )
+
+
+async def send_feature_menu_reply(bot, message, **kwargs):
+    content = "请选择要使用的功能。"
+    display_text, full_reply_url = await prepare_text_reply(bot, content)
+    return await reply_feature_menu(
+        message,
+        content=display_text,
+        full_reply_url=full_reply_url,
+        **kwargs,
+    )
+
+
+async def send_novelai_prompt_options_reply(
+    bot,
+    message,
+    content: str,
+    prompts: tuple[str, ...],
+    token: str,
+    **kwargs,
+):
+    display_text, full_reply_url = await prepare_text_reply(bot, content)
+    return await reply_with_novelai_prompt_options(
+        message,
+        display_text,
+        prompts,
+        token,
+        full_reply_url=full_reply_url,
+        **kwargs,
+    )
+
+
+async def reply_image_prompt_rejection(
+    bot,
+    message,
+    reason: str,
+    suggestion: str,
+    *,
+    original_prompt: str | None = None,
+) -> None:
+    safe_reason = (reason or "提示词未通过生成前检查。").replace("`", "'")
+    safe_suggestion = (
+        suggestion or SAFE_IMAGE_PROMPT_FALLBACK
+    ).replace("`", "'")
+    await send_text_reply(
+        bot,
+        message,
+        "请求未生成。\n\n"
+        f"拦截原因：{safe_reason}\n\n"
+        f"建议英文提示词：`{safe_suggestion}`",
+        novelai_suggestion=(
+            safe_suggestion if original_prompt is None else None
+        ),
+        novelai_prompt_request=original_prompt,
+    )
 
 
 class AiQQBot(botpy.Client):
@@ -30,7 +151,9 @@ class AiQQBot(botpy.Client):
         self.conversations = ConversationManager(self.ai, self.memory)
         self.novelai = NovelAIService.from_env()
         self.image_usage = ImageUsageStore.from_env()
+        self.prompt_sessions = PromptSessionStore.from_env()
         self.media_store = TemporaryMediaStore.from_env()
+        self.reply_store = TemporaryReplyStore.from_env()
         self.panels = PanelService(self.http)
         self._panel_sync_lock = asyncio.Lock()
         self._panel_synced = False
@@ -38,7 +161,9 @@ class AiQQBot(botpy.Client):
     async def on_ready(self):
         await self.memory.initialize()
         await self.image_usage.initialize()
+        await self.prompt_sessions.initialize()
         await self.media_store.initialize()
+        await self.reply_store.initialize()
         logger.info("AiQQ 已登录：%s", self.robot.name)
         if self.ai.is_configured:
             logger.info("AI 服务已配置，模型：%s", self.ai.model)
@@ -81,6 +206,7 @@ class AiQQBot(botpy.Client):
         app = web.Application()
         app.router.add_get("/health", self.health)
         app.router.add_get("/media/{file_name}", self.media_store.serve)
+        app.router.add_get("/reply/{file_name}", self.reply_store.serve)
         runner = web.AppRunner(app)
         await runner.setup()
 
@@ -134,21 +260,81 @@ class AiQQBot(botpy.Client):
             )
             return
 
+        prompt_description = extract_novelai_prompt_request(prompt)
+        if prompt_description is not None:
+            await self.prepare_novelai_prompt(
+                message, conversation_key, prompt_description
+            )
+            return
+
+        prompt_edit = extract_novelai_prompt_edit_request(prompt)
+        if prompt_edit is not None:
+            token, request = prompt_edit
+            await self.revise_novelai_prompt(
+                message, conversation_key, token, request
+            )
+            return
+
+        menu_suggestion = extract_menu_suggestion(prompt)
+        if menu_suggestion is not None:
+            prompt_request = (
+                extract_novelai_prompt_request(menu_suggestion)
+                if menu_suggestion
+                else None
+            )
+            await send_feature_menu_reply(
+                self,
+                message,
+                novelai_suggestion=(
+                    menu_suggestion
+                    if menu_suggestion and prompt_request is None
+                    else None
+                ),
+                novelai_prompt_request=prompt_request,
+            )
+            return
+
         if prompt in MEMORY_CLEAR_COMMANDS:
             await self.conversations.clear(conversation_key)
-            await reply_with_clear_memory_button(message, "已清除你的对话记忆。")
+            await send_text_reply(self, message, "已清除你的对话记忆。")
             return
 
         msg_seq = 1
 
         async def report_stage(content: str) -> None:
             nonlocal msg_seq
+            if msg_seq > MAX_RESEARCH_STAGE_REPLIES:
+                return
             current_seq = msg_seq
             msg_seq += 1
             await reply_research_stage(message, content, msg_seq=current_seq)
 
         try:
             async with asyncio.timeout(self.ai.total_timeout_seconds):
+                moderation = await self.ai.moderate_chat_prompt(prompt)
+                if not moderation.available:
+                    await send_text_reply(
+                        self,
+                        message,
+                        "内容安全检查暂时不可用，本次请求已拒绝，请稍后再试。",
+                    )
+                    return
+                if not moderation.safe:
+                    reason = moderation.reason.replace("`", "'")
+                    if moderation.category == "adult_content":
+                        logger.info("已拦截普通对话中的成人内容")
+                        content = (
+                            "警告：检测到不适合公开群聊的成人内容，本次请求已拒绝。"
+                            f"\n\n原因：{reason}"
+                        )
+                    else:
+                        logger.info("已拦截更改机器人固定角色的请求")
+                        content = (
+                            "角色设定固定，不能由用户更改，本次请求已拒绝。"
+                            f"\n\n原因：{reason}"
+                        )
+                    await send_text_reply(self, message, content)
+                    return
                 result = await self.conversations.chat(
                     conversation_key,
                     prompt,
@@ -158,32 +344,211 @@ class AiQQBot(botpy.Client):
             logger.warning("AI 对话超过 %s 秒总时限", self.ai.total_timeout_seconds)
             result = AIResult("AI 查询时间过长，本次已停止，请稍后重试。", False)
 
-        await reply_with_clear_memory_button(message, result.text, msg_seq=msg_seq)
+        await send_text_reply(self, message, result.text, msg_seq=msg_seq)
         if result.success:
             await self.conversations.summarize_if_needed(conversation_key)
+
+    async def prepare_novelai_prompt(
+        self, message, conversation_key: str, description: str
+    ) -> None:
+        if not description:
+            await send_text_reply(
+                self,
+                message,
+                f"请在 `{NOVELAI_PROMPT_COMMAND}` 后输入画面描述，例如："
+                f"`{NOVELAI_PROMPT_COMMAND} 一位站在樱花树下的白发少女`。",
+            )
+            return
+        if len(description) > MAX_IMAGE_PROMPT_CHARS:
+            await send_text_reply(
+                self,
+                message,
+                f"画面描述超过了 {MAX_IMAGE_PROMPT_CHARS} 个字符的长度限制。",
+            )
+            return
+
+        try:
+            async with asyncio.timeout(self.ai.total_timeout_seconds):
+                moderation = await self.ai.moderate_image_prompt(description)
+                if not moderation.available or not moderation.safe:
+                    await reply_image_prompt_rejection(
+                        self,
+                        message,
+                        moderation.reason,
+                        moderation.suggested_prompt,
+                    )
+                    return
+
+                context = await self.conversations.load_context(conversation_key)
+                result = await self.ai.create_novelai_prompts(
+                    description,
+                    history=context.model_history(),
+                    summary=context.summary,
+                )
+                if not result.success:
+                    await send_text_reply(self, message, result.error)
+                    return
+
+                output_moderation = await self.ai.moderate_image_prompt(
+                    "\n".join(result.prompts)
+                )
+                if not output_moderation.available or not output_moderation.safe:
+                    await reply_image_prompt_rejection(
+                        self,
+                        message,
+                        output_moderation.reason,
+                        output_moderation.suggested_prompt,
+                    )
+                    return
+        except TimeoutError:
+            await send_text_reply(
+                self,
+                message,
+                "AI 提示词生成时间过长，本次已停止，请稍后重试。",
+            )
+            return
+
+        session = await self.prompt_sessions.create(
+            conversation_key, result.prompts
+        )
+        content = format_novelai_prompt_options(session.prompts)
+        await self.conversations.record_round(
+            conversation_key,
+            f"{NOVELAI_PROMPT_COMMAND} {description}",
+            content,
+        )
+        await self.conversations.summarize_if_needed(conversation_key)
+        await send_novelai_prompt_options_reply(
+            self,
+            message,
+            content,
+            session.prompts,
+            session.token,
+            max_chars=self.ai.max_reply_chars,
+        )
+
+    async def revise_novelai_prompt(
+        self,
+        message,
+        conversation_key: str,
+        token: str,
+        request: str,
+    ) -> None:
+        session = await self.prompt_sessions.load(conversation_key, token)
+        if session is None:
+            await send_text_reply(
+                self,
+                message,
+                "提示词修改会话不存在或已超过 15 分钟，请重新使用 NovelAI提示词 指令。",
+            )
+            return
+        if not request:
+            await send_text_reply(
+                self,
+                message,
+                "请在修改指令后继续输入要求，例如：方案2改成夜景，并使用半身构图。",
+            )
+            return
+        if len(request) > MAX_IMAGE_PROMPT_CHARS:
+            await send_text_reply(
+                self,
+                message,
+                f"修改要求超过了 {MAX_IMAGE_PROMPT_CHARS} 个字符的长度限制。",
+            )
+            return
+
+        try:
+            async with asyncio.timeout(self.ai.total_timeout_seconds):
+                moderation = await self.ai.moderate_image_prompt(request)
+                if not moderation.available or not moderation.safe:
+                    await reply_image_prompt_rejection(
+                        self,
+                        message,
+                        moderation.reason,
+                        moderation.suggested_prompt,
+                    )
+                    return
+
+                context = await self.conversations.load_context(conversation_key)
+                result = await self.ai.revise_novelai_prompts(
+                    session.prompts,
+                    request,
+                    history=context.model_history(),
+                    summary=context.summary,
+                )
+                if not result.success:
+                    await send_text_reply(self, message, result.error)
+                    return
+
+                output_moderation = await self.ai.moderate_image_prompt(
+                    "\n".join(result.prompts)
+                )
+                if not output_moderation.available or not output_moderation.safe:
+                    await reply_image_prompt_rejection(
+                        self,
+                        message,
+                        output_moderation.reason,
+                        output_moderation.suggested_prompt,
+                    )
+                    return
+        except TimeoutError:
+            await send_text_reply(
+                self,
+                message,
+                "AI 提示词修改时间过长，本次已停止，请稍后重试。",
+            )
+            return
+
+        next_session = await self.prompt_sessions.create(
+            conversation_key, result.prompts
+        )
+        content = format_novelai_prompt_options(next_session.prompts)
+        await self.conversations.record_round(
+            conversation_key,
+            f"{NOVELAI_PROMPT_EDIT_COMMAND} {request}",
+            content,
+        )
+        await self.conversations.summarize_if_needed(conversation_key)
+        await send_novelai_prompt_options_reply(
+            self,
+            message,
+            content,
+            next_session.prompts,
+            next_session.token,
+            max_chars=self.ai.max_reply_chars,
+        )
 
     async def generate_novelai_image(
         self, message, conversation_key: str, prompt: str
     ) -> None:
         if not prompt:
-            await reply_with_clear_memory_button(
+            await reply_image_prompt_rejection(
+                self,
                 message,
-                f"请在 `{NOVELAI_IMAGE_COMMAND}` 后输入图片提示词。",
+                f"没有在 `{NOVELAI_IMAGE_COMMAND}` 后提供图片提示词。",
+                SAFE_IMAGE_PROMPT_FALLBACK,
+                original_prompt=prompt,
             )
             return
         if len(prompt) > MAX_IMAGE_PROMPT_CHARS:
-            await reply_with_clear_memory_button(
+            await reply_image_prompt_rejection(
+                self,
                 message,
-                f"图片提示词不能超过 {MAX_IMAGE_PROMPT_CHARS} 个字符。",
+                f"图片提示词超过了 {MAX_IMAGE_PROMPT_CHARS} 个字符的长度限制。",
+                SAFE_IMAGE_PROMPT_FALLBACK,
+                original_prompt=prompt,
             )
             return
         if not self.novelai.is_configured:
-            await reply_with_clear_memory_button(
-                message, "NovelAI 生图服务尚未配置。"
+            await send_text_reply(
+                self,
+                message,
+                "NovelAI 生图服务尚未配置。",
             )
             return
         if not self.novelai.is_ready:
-            await reply_with_clear_memory_button(
+            await send_text_reply(
+                self,
                 message,
                 "NovelAI MCP 尚未完成能力检查，生图功能暂不可用。",
             )
@@ -191,8 +556,12 @@ class AiQQBot(botpy.Client):
 
         moderation = await self.ai.moderate_image_prompt(prompt)
         if not moderation.available:
-            await reply_with_clear_memory_button(
-                message, "安全审核暂时不可用，本次未生成图片，请稍后重试。"
+            await reply_image_prompt_rejection(
+                self,
+                message,
+                moderation.reason,
+                moderation.suggested_prompt,
+                original_prompt=prompt,
             )
             return
         if not moderation.safe:
@@ -200,49 +569,54 @@ class AiQQBot(botpy.Client):
                 "已拦截不安全的 NovelAI 提示词：category=%s",
                 moderation.category,
             )
-            await reply_with_clear_memory_button(
+            await reply_image_prompt_rejection(
+                self,
                 message,
-                "请求未生成：提示词包含不适合公开群聊的成人、裸露或性暗示内容，请修改后重试。",
+                moderation.reason,
+                moderation.suggested_prompt,
+                original_prompt=prompt,
             )
             return
 
         review = await self.ai.review_image_prompt(prompt)
         if not review.available:
-            await reply_with_clear_memory_button(
+            await reply_image_prompt_rejection(
+                self,
                 message,
-                "提示词有效性检查暂时不可用，本次未生成图片，请稍后重试。",
+                review.reason,
+                review.suggested_prompt,
+                original_prompt=prompt,
             )
             return
         if review.contains_chinese:
-            suggestion = review.suggested_prompt.replace("`", "'")
-            await reply_with_clear_memory_button(
+            await reply_image_prompt_rejection(
+                self,
                 message,
-                "检测到提示词包含中文字符，建议改用英文后重新提交。\n\n"
-                f"建议英文提示词：`{suggestion}`",
-                novelai_suggestion=suggestion,
+                review.reason,
+                review.suggested_prompt,
+                original_prompt=prompt,
             )
             return
         if not review.effective:
-            content = "请求未生成：提示词缺少明确、可生成的画面内容。"
-            suggestion = ""
-            if review.suggested_prompt:
-                suggestion = review.suggested_prompt.replace("`", "'")
-                content += f"\n\n修改建议：`{suggestion}`"
-            await reply_with_clear_memory_button(
+            await reply_image_prompt_rejection(
+                self,
                 message,
-                content,
-                novelai_suggestion=suggestion or None,
+                review.reason,
+                review.suggested_prompt,
+                original_prompt=prompt,
             )
             return
 
         usage = await self.image_usage.reserve_attempt(conversation_key)
         if not usage.allowed:
-            await reply_with_clear_memory_button(message, usage.message)
+            await send_text_reply(self, message, usage.message)
             return
 
         try:
-            await reply_with_clear_memory_button(
-                message, "提示词审核通过，NovelAI 正在生成图片..."
+            await send_text_reply(
+                self,
+                message,
+                "提示词审核通过，NovelAI 正在生成图片...",
             )
             image = await self.novelai.generate(prompt)
             await self.image_usage.record_success(conversation_key)
@@ -258,20 +632,27 @@ class AiQQBot(botpy.Client):
                 raise QQMediaError("发送 QQ 富媒体图片失败。") from exc
         except NovelAIError as exc:
             logger.warning("NovelAI 生图失败：%s", exc)
-            await reply_with_clear_memory_button(
-                message, "NovelAI 生图失败，请稍后重试。", msg_seq=2
+            await send_text_reply(
+                self,
+                message,
+                "NovelAI 生图失败，请稍后重试。",
+                msg_seq=2,
             )
         except QQMediaError as exc:
             logger.warning("QQ 图片上传失败：%s", exc)
-            await reply_with_clear_memory_button(
+            await send_text_reply(
+                self,
                 message,
                 "图片已生成，但上传到 QQ 失败，请稍后重试。",
                 msg_seq=2,
             )
         except Exception:
             logger.exception("NovelAI 生图流程发生未知错误")
-            await reply_with_clear_memory_button(
-                message, "NovelAI 生图服务暂时不可用。", msg_seq=2
+            await send_text_reply(
+                self,
+                message,
+                "NovelAI 生图服务暂时不可用。",
+                msg_seq=2,
             )
         finally:
             await self.image_usage.finish_attempt(conversation_key)

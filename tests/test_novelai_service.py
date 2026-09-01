@@ -7,7 +7,6 @@ from novelai_service import (
     NOVELAI_MODEL,
     NOVELAI_STEPS,
     NOVELAI_WIDTH,
-    QUALITY_PROMPT_SUFFIX,
     SAFE_NEGATIVE_PROMPT,
     SAFE_PROMPT_PREFIX,
     NovelAIError,
@@ -57,6 +56,43 @@ def image_result(data=b"png-data"):
 
 
 class NovelAIServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_fixed_negative_prompt_only_covers_adult_content(self):
+        included_tags = (
+            "nsfw",
+            "explicit",
+            "nude",
+            "sex",
+            "suggestive",
+            "fetish",
+            "lingerie",
+            "child sexualization",
+        )
+        for tag in included_tags:
+            self.assertIn(tag, SAFE_NEGATIVE_PROMPT)
+
+    def test_fixed_negative_prompt_has_no_quality_or_rendering_tags(self):
+        omitted_tags = (
+            "text",
+            "watermark",
+            "deformed",
+            "bad anatomy",
+            "bad hands",
+            "worst quality",
+            "lowres",
+            "blurry",
+            "monochrome",
+            "film grain",
+            "1990s (style)",
+            "pointy ears",
+            "amputee",
+            "chromatic aberration",
+            "chibi",
+            "muscular male",
+        )
+        prompt_tags = {tag.strip() for tag in SAFE_NEGATIVE_PROMPT.split(",")}
+        for tag in omitted_tags:
+            self.assertNotIn(tag, prompt_tags)
+
     async def test_generation_uses_only_fixed_text_to_image_parameters(self):
         client = FakeMCPClient(image_result(), supports_steps=True)
         service = NovelAIService(client)
@@ -77,31 +113,17 @@ class NovelAIServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             arguments,
             {
-                "prompt": (
-                    f"{SAFE_PROMPT_PREFIX}, 1girl, blue hair --seed 999, "
-                    f"{QUALITY_PROMPT_SUFFIX}"
-                ),
+                "prompt": f"{SAFE_PROMPT_PREFIX}, 1girl, blue hair --seed 999",
                 "negative_prompt": SAFE_NEGATIVE_PROMPT,
                 "model": NOVELAI_MODEL,
                 "width": NOVELAI_WIDTH,
                 "height": NOVELAI_HEIGHT,
                 "seed": None,
-                "quality_toggle": True,
+                "quality_toggle": False,
                 "variety_boost": True,
                 "steps": NOVELAI_STEPS,
             },
         )
-        for quality_tag in (
-            "best quality",
-            "amazing quality",
-            "highres",
-            "absurdres",
-            "finely detailed",
-            "intricate details",
-            "sharp focus",
-        ):
-            self.assertIn(quality_tag, arguments["prompt"])
-
     async def test_server_default_is_used_when_server_hides_steps(self):
         client = FakeMCPClient(image_result(), supports_steps=False)
         service = NovelAIService(client)
