@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aiqq"
+version = "0.1.0"
+description = "QQ group-chat AI bot"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "qq-botpy>=1.2.1,<2",
+    "python-dotenv>=1.0,<2",
+    "aiohttp>=3.9,<4",
+    "openai>=1.68,<2",
+    "aiosqlite>=0.20,<1",
+    "mistune>=3.0,<4",
+    "Pillow>=10.4,<12",
+    "pydantic>=2.8,<3",
+    "openai-codex-sdk==0.1.11",
+]
+
+[project.scripts]
+aiqq = "aiqq.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.unittest]
+start-directory = "tests"

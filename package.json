@@ -1,0 +1,8 @@
+{
+  "name": "aiqq-codex-runtime",
+  "private": true,
+  "description": "Project-local Codex CLI runtime used by the AiQQ Python SDK",
+  "dependencies": {
+    "@openai/codex": "0.152.1"
+  }
+}
