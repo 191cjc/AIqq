@@ -31,3 +31,25 @@ Added required-nullable AI-selected dimensions, native aspect-ratio selection, e
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: Textual bot mention trigger
+<!-- trellis-session: v=2 fp=35fb0281b7a8ea8b -->
+
+**Date**: 2026-09-17
+**Task**: Textual bot mention trigger
+**Branch**: `main`
+
+### Summary
+
+Added runtime-name textual @ mention dispatch and normalization while preserving raw persistence, native mention handling, and raw/SDK dedup.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `eab1da9` | feat: support textual bot mentions |
+
+### Status
+
+[OK] **Completed**
