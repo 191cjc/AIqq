@@ -22,6 +22,7 @@ from .ui import feature_menu_keyboard
 
 logger = logging.getLogger(__name__)
 BOT_MENTION_RE = re.compile(r"^\s*<@!?[^>]+>\s*")
+DEFAULT_BOT_NAME = "AiQQ"
 MAX_TRACKED_MESSAGE_IDS = 2048
 DEFERRED_LINK_UNAVAILABLE_TEXT = "任务处理时间过长，但进展页面暂时不可用。"
 
@@ -316,24 +317,34 @@ def clean_prompt(content: str | None) -> str:
     return BOT_MENTION_RE.sub("", content or "").strip()
 
 
-def raw_event_mentions_bot(payload: dict[str, object]) -> bool:
+def raw_event_mentions_bot(
+    payload: dict[str, object], *, bot_name: str = DEFAULT_BOT_NAME
+) -> bool:
     data = payload.get("d")
     if not isinstance(data, dict):
         return False
     mentions = data.get("mentions")
-    return isinstance(mentions, list) and any(
+    if isinstance(mentions, list) and any(
         isinstance(mention, dict) and mention.get("is_you") is True
         for mention in mentions
+    ):
+        return True
+    content = data.get("content")
+    return isinstance(content, str) and _starts_with_text_bot_mention(
+        content, bot_name
     )
 
 
-def normalized_group_message_data(payload: dict[str, object]) -> dict | None:
+def normalized_group_message_data(
+    payload: dict[str, object], *, bot_name: str = DEFAULT_BOT_NAME
+) -> dict | None:
     data = payload.get("d")
     if not isinstance(data, dict):
         return None
     normalized = dict(data)
     content = clean_prompt(str(normalized.get("content") or ""))
     mentions = normalized.get("mentions")
+    removed_native_mention = False
     if isinstance(mentions, list):
         for mention in mentions:
             if not isinstance(mention, dict) or mention.get("is_you") is not True:
@@ -341,6 +352,15 @@ def normalized_group_message_data(payload: dict[str, object]) -> dict | None:
             username = mention.get("username")
             if isinstance(username, str) and content.startswith(f"@{username}"):
                 content = content[len(username) + 1 :].lstrip()
+                removed_native_mention = True
                 break
+    name = bot_name.strip()
+    if not removed_native_mention and _starts_with_text_bot_mention(content, name):
+        content = content[len(name) + 1 :].lstrip()
     normalized["content"] = content
     return normalized
+
+
+def _starts_with_text_bot_mention(content: str, bot_name: str) -> bool:
+    name = bot_name.strip()
+    return bool(name) and content.lstrip().startswith(f"@{name}")

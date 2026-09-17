@@ -20,6 +20,7 @@ from aiqq.services.qq.sender import QQMessageSender
 
 from .gateway import GatewayStatus, MonitoredBotWebSocket
 from .handlers import (
+    DEFAULT_BOT_NAME,
     GroupMessageHandler,
     IncomingGroupMessage,
     normalized_group_message_data,
@@ -67,6 +68,7 @@ class AiQQClient(botpy.Client):
         )
         self._qq_config = qq_config
         self._web_config = web_config
+        self._bot_name = DEFAULT_BOT_NAME
         self.gateway_status = GatewayStatus()
         self._components = component_factory(self)
         self._ready_lock = asyncio.Lock()
@@ -94,8 +96,9 @@ class AiQQClient(botpy.Client):
                 return
             for initialize in self._components.initializers:
                 await initialize()
-            bot_name = getattr(self.robot, "name", "") or "AiQQ"
-            self._components.sender.set_bot_username(bot_name)
+            bot_name = str(getattr(self.robot, "name", "") or "").strip()
+            self._bot_name = bot_name or DEFAULT_BOT_NAME
+            self._components.sender.set_bot_username(self._bot_name)
             try:
                 panel_result = await self._components.panel.sync()
                 logger.info(
@@ -109,7 +112,7 @@ class AiQQClient(botpy.Client):
                 )
             await self._start_web_server()
             self._initialized = True
-            logger.info("event=aiqq_ready bot_name=%s", bot_name)
+            logger.info("event=aiqq_ready bot_name=%s", self._bot_name)
 
     async def on_group_at_message_create(self, message: GroupMessage) -> None:
         await self._components.message_handler.handle(_incoming(message))
@@ -141,9 +144,11 @@ class AiQQClient(botpy.Client):
             return
         if event_type not in {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
             return
-        if event_type == "GROUP_MESSAGE_CREATE" and not raw_event_mentions_bot(payload):
+        if event_type == "GROUP_MESSAGE_CREATE" and not raw_event_mentions_bot(
+            payload, bot_name=self._bot_name
+        ):
             return
-        data = normalized_group_message_data(payload)
+        data = normalized_group_message_data(payload, bot_name=self._bot_name)
         if data is None:
             return
         message = GroupMessage(self.api, payload.get("id"), data)

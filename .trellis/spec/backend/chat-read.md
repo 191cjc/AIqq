@@ -10,6 +10,8 @@ or image/delivery metadata. Packaged `src/aiqq` is authoritative.
 
 ```python
 await repository.add_gateway_event(event_type, envelope, raw_text=text, connection_id=id)
+raw_event_mentions_bot(payload, bot_name=current_bot_name)
+normalized_group_message_data(payload, bot_name=current_bot_name)
 await repository.get_current_for_reference(group_id, message_id)
 await repository.list_for_reference(group_id, before_message_id=message_id, limit=50)
 await repository.query_history(group_id, **filters)
@@ -41,6 +43,14 @@ production serialization whitelist. `ConversationRequest` carries `group_id`,
   Identity is `(group_openid, message_id)`. Duplicate/missing-field snapshots
   cannot erase earlier richer data; conflicting versions remain traceable.
   Recovery applies only local projections, never chat, quota, generation or send.
+- A full-group `GROUP_MESSAGE_CREATE` dispatches when QQ marks a structured
+  `mentions[].is_you=true` mention or when content, after leading whitespace,
+  starts with the exact case-sensitive `@<current runtime bot name>`. The runtime
+  name comes from `robot.name` with `AiQQ` only as its empty-name fallback; never
+  hard-code a deployed display name. Remove one matching leading mention before
+  existing command/conversation routing. Mid-message, partial, old-name and alias
+  text remain stored but do not dispatch. Raw/SDK delivery of one message still
+  relies on the shared `(group_id, message_id)` handler deduplication.
 - Current attachments normally resolve to exact immutable source metadata.
   Directly nested image objects enriched across receipts instead carry explicit
   `metadata_source=current_projection`, `version_id=null` and actual
@@ -103,6 +113,8 @@ production serialization whitelist. `ConversationRequest` carries `group_id`,
 | Per-request limit | Explicit `budget_exhausted`, no silent truncation |
 | Actual model context limit | `AgentContextTooLarge`, clear capacity text, no shortened retry |
 | Projection failure/cancellation | Durable raw event remains recoverable; no business replay |
+| Leading exact text `@<runtime name>` | Persist, strip one prefix, then dispatch through the existing handler |
+| Mid-message / partial / stale text name | Persist without business dispatch |
 | Isolation unavailable | Chat unavailable; no unrestricted-shell fallback |
 
 Do not log prompts, full events, signed URLs, group/member identifiers or keys in
@@ -120,16 +132,22 @@ summarization from hiding the original-image expiry reason again.
 
 - Good: 50 full records exceeding 10,000 characters, plus a current attachment,
   survive DB → workflow → chat serialization exactly, including future columns.
+- Good: a leading textual `@<runtime name>` is persisted, normalized once and
+  dispatched; a simultaneous native callback is removed by handler deduplication.
 - Base: a historical GIF is selected, downloaded on demand, sampled into three
   real visual inputs, then removed at request completion.
+- Bad: matching a hard-coded deployed bot name, triggering on a mid-message name,
+  or bypassing raw persistence to dispatch textual mentions.
 - Bad: interpreting a path as image understanding; publishing only seven known
   fields; downloading every incoming image; restoring an old DB over new messages.
 
 ## 6. Required Tests and Deployment Checks
 
 Assert complete DB-to-model equality (future columns, deep unknown fields, more
-than 20 attachments, false/null/zero, multiline text); current image-only @ and
-raw/SDK dedup; stable same-group history/version paging; legacy migration with
+than 20 attachments, false/null/zero, multiline text); current image-only @,
+runtime-name text @ (leading whitespace, no separator, empty/image-only body,
+partial/old/mid-message rejection), native mentions and raw/SDK dedup; stable
+same-group history/version paging; legacy migration with
 unchanged IDs/all original columns; raw commit + failure/restart recovery; late
 local recall; input animation budgets and cleanup; real SDK offline tool
 execution followed by pixel input; file/symlink/proc/other-turn denial; bridge
@@ -188,6 +206,11 @@ real provider with a bounded web search, result opening and image search before
 claiming a search-path repair has restored all those operations.
 
 ## 7. Wrong vs Correct
+
+Wrong: hard-code the current deployed bot display name or dispatch any message
+that merely contains it. Correct: capture `robot.name` at readiness, require an
+exact leading `@<runtime name>`, preserve the raw event first, normalize once and
+reuse the existing handler and deduplication.
 
 Wrong: enable shell/view_image flags while retaining a handler that aborts every
 command event, or claim read-only/workspace-write prevents host file reads.

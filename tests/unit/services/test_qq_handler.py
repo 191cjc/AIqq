@@ -342,6 +342,65 @@ class GroupMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
             raw_event_mentions_bot({"d": {"content": "hello", "mentions": []}})
         )
 
+    def test_leading_text_bot_mention_uses_runtime_name_and_is_removed(self):
+        for content, expected in (
+            ("@CurrentBot 你好", "你好"),
+            ("  @CurrentBot你好", "你好"),
+            ("@CurrentBot", ""),
+        ):
+            with self.subTest(content=content):
+                payload = {"d": {"content": content, "mentions": []}}
+                self.assertTrue(
+                    raw_event_mentions_bot(payload, bot_name="CurrentBot")
+                )
+                self.assertEqual(
+                    normalized_group_message_data(
+                        payload, bot_name="CurrentBot"
+                    )["content"],
+                    expected,
+                )
+
+    def test_text_bot_mention_rejects_mid_message_partial_and_old_names(self):
+        for content in (
+            "你好 @CurrentBot",
+            "@Current",
+            "@OldBot 你好",
+            "@currentbot 你好",
+            "普通消息",
+        ):
+            with self.subTest(content=content):
+                payload = {"d": {"content": content, "mentions": []}}
+                self.assertFalse(
+                    raw_event_mentions_bot(payload, bot_name="CurrentBot")
+                )
+
+    async def test_empty_text_mention_uses_existing_empty_or_image_flow(self):
+        for has_attachments, expects_workflow in ((False, False), (True, True)):
+            with self.subTest(has_attachments=has_attachments):
+                handler, workflow, sender, _replies = self.make_handler()
+                data = normalized_group_message_data(
+                    {"d": {"content": "@CurrentBot", "mentions": []}},
+                    bot_name="CurrentBot",
+                )
+                message = IncomingGroupMessage(
+                    "group-1",
+                    f"message-{int(has_attachments)}",
+                    "member-1",
+                    data["content"],
+                    has_attachments,
+                )
+
+                self.assertTrue(await handler.handle(message))
+
+                self.assertEqual(bool(workflow.calls), expects_workflow)
+                if has_attachments:
+                    self.assertIn("图片", workflow.calls[0]["user_input"])
+                else:
+                    self.assertEqual(
+                        sender.text_calls[0]["content"],
+                        "请告诉我需要处理的问题。",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
