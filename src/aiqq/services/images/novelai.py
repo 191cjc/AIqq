@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 import aiohttp
 
+from aiqq.exceptions import ImageGenerationUnavailable
 from aiqq.logic.models import ImageAsset
 
 from .validation import InvalidImage, decode_base64_image
@@ -33,8 +34,8 @@ SAFE_NEGATIVE_PROMPT = (
 )
 
 
-class NovelAIError(RuntimeError):
-    pass
+class NovelAIError(ImageGenerationUnavailable, RuntimeError):
+    """Expected NovelAI failure, compatible with existing RuntimeError catches."""
 
 
 class NovelAIMCPTransport(Protocol):
@@ -214,35 +215,56 @@ class NovelAIService:
         return self.is_configured and self._supports_steps is not None
 
     async def initialize(self) -> None:
+        logger.info(
+            "event=novelai_initialization_started configured=%s", self.is_configured
+        )
         await self.check_connection()
 
     async def check_connection(self) -> bool:
+        self._supports_steps = None
         if self._client is None:
+            logger.warning(
+                "event=novelai_connection_check_failed configured=false "
+                "ready=false error_kind=not_configured"
+            )
             return False
         try:
             tools = await self._client.list_tools()
+            supports_steps = self._tool_supports_steps(tools)
         except Exception as exc:
-            self._supports_steps = None
             logger.warning(
-                "event=novelai_connection_check_failed error_type=%s",
+                "event=novelai_connection_check_failed configured=true "
+                "ready=false error_kind=not_ready error_type=%s",
                 type(exc).__name__,
             )
             return False
-        self._supports_steps = self._tool_supports_steps(tools)
+        if supports_steps is None:
+            logger.warning(
+                "event=novelai_connection_check_failed configured=true "
+                "ready=false error_kind=generate_image_not_advertised"
+            )
+            return False
+        self._supports_steps = supports_steps
         if not self._supports_steps:
             logger.warning(
                 "event=novelai_steps_not_advertised default_steps=%s",
                 NOVELAI_STEPS,
             )
+        logger.info(
+            "event=novelai_connection_ready configured=true ready=true "
+            "supports_steps=%s", self._supports_steps,
+        )
         return True
 
     async def generate(
         self, prompt: str, *, orientation: str = "square"
     ) -> ImageAsset:
         if self._client is None:
-            raise NovelAIError("NovelAI service is not configured")
+            raise NovelAIError(
+                "NovelAI service is not configured", kind="not_configured"
+            )
         if self._supports_steps is None:
-            raise NovelAIError("NovelAI service is not ready")
+            raise NovelAIError("NovelAI service is not ready", kind="not_ready")
         try:
             width, height = NOVELAI_IMAGE_SIZES[orientation]
         except KeyError as exc:
@@ -271,19 +293,20 @@ class NovelAIService:
         return image
 
     @staticmethod
-    def _tool_supports_steps(tools_response: dict[str, Any]) -> bool:
+    def _tool_supports_steps(tools_response: dict[str, Any]) -> bool | None:
         tools = tools_response.get("tools", [])
         if not isinstance(tools, list):
-            return False
+            return None
         for tool in tools:
             if not isinstance(tool, dict) or tool.get("name") != "generate_image":
                 continue
             schema = tool.get("inputSchema", {})
             properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
             return isinstance(properties, dict) and "steps" in properties
-        return False
+        return None
 
     async def close(self) -> None:
+        self._supports_steps = None
         if self._client is not None:
             await self._client.close()
 

@@ -13,6 +13,9 @@ from aiohttp.abc import AbstractResolver
 
 from aiqq.logic.models import ImageAsset
 from aiqq.services.images.validation import InvalidImage, MAX_IMAGE_BYTES, validate_image
+from aiqq.services.images.chat_decode import (
+    ChatImageDecodeError, DecodedChatImage, decode_chat_image,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -22,6 +25,24 @@ READ_CHUNK_SIZE = 64 * 1024
 
 class WebImageError(RuntimeError):
     """Raised when an untrusted image URL cannot produce a safe image."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "download_failed",
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind if kind in {
+            "not_found", "timeout", "access_denied", "invalid_image",
+            "too_large", "download_failed",
+        } else "download_failed"
+        self.status_code = (
+            status_code
+            if type(status_code) is int and 100 <= status_code <= 599
+            else None
+        )
 
 
 class PublicOnlyResolver(AbstractResolver):
@@ -58,15 +79,41 @@ class WebImageService:
             raise ValueError("timeout_seconds must be positive")
         self._timeout_seconds = timeout_seconds
         self._session: aiohttp.ClientSession | None = None
+        self._read_slots = asyncio.Semaphore(4)
 
     async def download(self, url: str) -> ImageAsset:
         try:
             async with asyncio.timeout(self._timeout_seconds):
                 return await self._download(url)
         except TimeoutError as exc:
-            raise WebImageError("web image download timed out") from exc
+            raise WebImageError("web image download timed out", kind="timeout") from exc
 
     async def _download(self, url: str) -> ImageAsset:
+        data, status = await self._download_bytes(url)
+        try:
+            return validate_image(data)
+        except InvalidImage as exc:
+            raise WebImageError(
+                "web resource is not a valid supported image",
+                kind="invalid_image", status_code=status,
+            ) from exc
+
+    async def download_for_read(self, url: str) -> DecodedChatImage:
+        """Download on demand; retain bytes only in this request's memory."""
+        try:
+            async with self._read_slots, asyncio.timeout(self._timeout_seconds):
+                data, status = await self._download_bytes(url)
+                try:
+                    return await asyncio.to_thread(decode_chat_image, data)
+                except ChatImageDecodeError as exc:
+                    raise WebImageError(
+                        "web resource cannot be read as an image",
+                        kind=exc.kind, status_code=status,
+                    ) from exc
+        except TimeoutError as exc:
+            raise WebImageError("web image download timed out", kind="timeout") from exc
+
+    async def _download_bytes(self, url: str) -> tuple[bytes, int]:
         current_url = validate_public_https_url(url)
         session = await self._get_session()
 
@@ -88,34 +135,53 @@ class WebImageService:
                         )
                         continue
                     if response.status < 200 or response.status >= 300:
+                        kind = "download_failed"
+                        if response.status in {404, 410}:
+                            kind = "not_found"
+                        elif response.status in {401, 403}:
+                            kind = "access_denied"
                         raise WebImageError(
-                            f"web image returned HTTP {response.status}"
+                            f"web image returned HTTP {response.status}",
+                            kind=kind,
+                            status_code=response.status,
                         )
                     content_type = response.headers.get("Content-Type", "")
                     if not content_type.split(";", 1)[0].strip().lower().startswith(
                         "image/"
                     ):
-                        raise WebImageError("web resource is not an image")
+                        raise WebImageError(
+                            "web resource is not an image",
+                            kind="invalid_image",
+                            status_code=response.status,
+                        )
                     if (
                         response.content_length is not None
                         and response.content_length > MAX_IMAGE_BYTES
                     ):
-                        raise WebImageError("web image exceeds the size limit")
+                        raise WebImageError(
+                            "web image exceeds the size limit",
+                            kind="too_large",
+                            status_code=response.status,
+                        )
 
                     data = bytearray()
                     async for chunk in response.content.iter_chunked(READ_CHUNK_SIZE):
                         data.extend(chunk)
                         if len(data) > MAX_IMAGE_BYTES:
-                            raise WebImageError("web image exceeds the size limit")
+                            raise WebImageError(
+                                "web image exceeds the size limit",
+                                kind="too_large",
+                                status_code=response.status,
+                            )
             except WebImageError:
+                raise
+            except TimeoutError:
+                # aiohttp timeouts also inherit OSError. Let download classify them.
                 raise
             except (aiohttp.ClientError, OSError) as exc:
                 raise WebImageError("web image could not be downloaded") from exc
 
-            try:
-                return validate_image(bytes(data))
-            except InvalidImage as exc:
-                raise WebImageError("web resource is not a valid supported image") from exc
+            return bytes(data), response.status
 
         raise WebImageError("web image download did not complete")
 

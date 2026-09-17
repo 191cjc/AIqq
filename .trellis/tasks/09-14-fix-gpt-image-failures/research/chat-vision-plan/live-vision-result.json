@@ -1,0 +1,10 @@
+{
+  "model": "gpt-6-astra",
+  "success": true,
+  "image_sources_read": 2,
+  "answer": "1：COPPER 7429\n2：ORBIT 3816",
+  "elapsed_seconds": 76.36,
+  "generation_requested": false,
+  "work_turns_remaining": 0,
+  "runtime_turns_remaining": 0
+}

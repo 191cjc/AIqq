@@ -1,8 +1,12 @@
 import asyncio
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from aiqq.exceptions import ImageGenerationUnavailable, PromptAuditUnavailable
+from aiqq.exceptions import (
+    ImageGenerationUnavailable,
+    PromptAuditUnavailable,
+    ReferenceImageUnavailable,
+)
 from aiqq.logic.conversation import (
     IMAGE_UNAVAILABLE_TEXT,
     OPTIONAL_IMAGE_FAILED_TEXT,
@@ -17,6 +21,8 @@ from aiqq.logic.models import (
     PromptAuditResult,
 )
 from aiqq.logic.image_quota import ImageQuotaManager
+from aiqq.services.images.reference import GroupReferenceImageLoader
+from aiqq.services.images.web import WebImageService
 
 
 class FakeAuditor:
@@ -31,6 +37,12 @@ class FakeAuditor:
 
 
 class FakeHistory:
+    async def get_current_for_reference(self, group_id, message_id):
+        return None
+
+    async def has_before(self, group_id, record_id):
+        return False
+
     def __init__(self, messages=(), error=None):
         self.messages = messages
         self.error = error
@@ -304,6 +316,119 @@ class ConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "ok")
         self.assertIn(OPTIONAL_IMAGE_FAILED_TEXT, result.full_text)
         self.assertEqual(result.images, ())
+
+    def make_edit_workflow(self, loader, usage, images):
+        return ConversationWorkflow(
+            prompt_auditor=FakeAuditor(),
+            history_repository=FakeHistory(),
+            conversation_agent=FakeChat(ChatAgentOutput(
+                "正在改图。", "正在改图喵。",
+                image_action=ImageAction("edit", "safe cat", source_record_id=609),
+            )),
+            image_usage=usage,
+            image_service=images,
+            image_prompt_auditor=FakeImageAuditor(),
+            reference_image_loader=loader,
+        )
+
+    async def run_edit(self, workflow):
+        return await workflow.run(
+            group_id="group", before_message_id="message", conversation_key="key",
+            user_input="edit the original image", request_id="reference-regression",
+        )
+
+    async def test_actual_download_404_and_410_reach_visible_expiry_without_generation(self):
+        for status in (404, 410):
+            with self.subTest(status=status):
+                downloader = WebImageService()
+                session = MagicMock()
+                session.get.return_value.__aenter__.return_value.status = status
+                references = AsyncMock()
+                references.list_image_urls.return_value = ("https://images.example/original?token=secret",)
+                loader = GroupReferenceImageLoader(repository=references, downloader=downloader)
+                usage_repository = AsyncMock()
+                usage_repository.success_count.return_value = 0
+                quota = ImageQuotaManager(usage_repository, daily_limit=100)
+                images = AsyncMock()
+                workflow = self.make_edit_workflow(loader, quota, images)
+                with patch.object(downloader, "_get_session", return_value=session), \
+                     patch.object(quota, "reserve_attempt", wraps=quota.reserve_attempt) as reserve, \
+                     self.assertLogs("aiqq", level="INFO") as logs:
+                    result = await self.run_edit(workflow)
+                    reserve.assert_not_awaited()
+                self.assertEqual(result.status, "unavailable")
+                self.assertEqual(result.error_code, "reference_image_expired")
+                self.assertEqual(result.full_text, "引用的图片已过期或已失效，请重新发送原图后再试。")
+                self.assertEqual(result.summary, result.full_text)
+                self.assertEqual(result.images, ())
+                session.get.assert_called_once()
+                references.list_image_urls.assert_awaited_once_with("group", 609)
+                images.generate.assert_not_awaited()
+                usage_repository.success_count.assert_not_awaited()
+                usage_repository.increment_success.assert_not_awaited()
+                log_text = "\n".join(logs.output)
+                self.assertIn(f"status={status}", log_text)
+                self.assertIn("request_id=reference-regression", log_text)
+                self.assertNotIn("token", log_text)
+                self.assertNotIn("secret", log_text)
+                self.assertNotIn("https://", log_text)
+                self.assertTrue((await quota.reserve_attempt("next-member")).allowed)
+                await quota.finish_attempt("next-member")
+
+    async def test_reference_failures_show_reason_and_action_in_summary_and_full_text(self):
+        cases = (
+            ("missing", "未找到可用的原图，请重新发送图片后再试。"),
+            ("timeout", "读取原图超时，请稍后重试，或重新发送图片。"),
+            ("access_denied", "无法访问原图，请重新发送图片后再试。"),
+            ("invalid_image", "原图无法读取，请重新发送有效的图片后再试。"),
+            ("too_large", "原图过大，读取失败，请压缩后重新发送。"),
+            ("download_failed", "原图下载失败，请稍后重试，或重新发送图片。"),
+            ("unknown\nprivate-kind", "原图下载失败，请稍后重试，或重新发送图片。"),
+        )
+        for kind, text in cases:
+            with self.subTest(kind=kind):
+                loader = AsyncMock()
+                loader.load.side_effect = ReferenceImageUnavailable(
+                    "private detail https://private?token=secret", kind=kind,
+                )
+                usage = FakeImageUsage()
+                images = AsyncMock()
+                with self.assertLogs("aiqq.logic.conversation") as logs:
+                    result = await self.run_edit(self.make_edit_workflow(loader, usage, images))
+                expected_kind = "download_failed" if kind.startswith("unknown") else kind
+                self.assertEqual(result.error_code, f"reference_image_{expected_kind}")
+                self.assertEqual(result.full_text, text)
+                self.assertEqual(result.summary, text)
+                self.assertEqual(result.status, "unavailable")
+                self.assertEqual(result.images, ())
+                self.assertLessEqual(len(result.summary), 50)
+                self.assertNotIn("private", "\n".join(logs.output))
+                images.generate.assert_not_awaited()
+                self.assertEqual(usage.reserved, [])
+                self.assertEqual(usage.recorded, [])
+                self.assertEqual(usage.finished, [])
+
+    async def test_legacy_none_reference_is_missing_and_cancellation_propagates(self):
+        for failure in (None, asyncio.CancelledError()):
+            with self.subTest(failure=type(failure).__name__):
+                loader = AsyncMock()
+                if failure is None:
+                    loader.load.return_value = None
+                else:
+                    loader.load.side_effect = failure
+                usage = FakeImageUsage()
+                images = AsyncMock()
+                workflow = self.make_edit_workflow(loader, usage, images)
+                if failure is None:
+                    result = await self.run_edit(workflow)
+                    self.assertEqual(result.error_code, "reference_image_missing")
+                    self.assertEqual(result.summary, result.full_text)
+                else:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await self.run_edit(workflow)
+                images.generate.assert_not_awaited()
+                self.assertEqual(usage.reserved, [])
+                self.assertEqual(usage.recorded, [])
 
 
 if __name__ == "__main__":

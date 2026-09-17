@@ -53,7 +53,7 @@ class SQLiteConnection:
             try:
                 yield connection
                 await connection.commit()
-            except Exception:
+            except BaseException:
                 await connection.rollback()
                 raise
 

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from aiqq.logic.models import ConversationResult, ImageAsset
 from aiqq.logic.ports import GroupMessageSender
+from aiqq.services.images.qq_upload import prepare_qq_image
 
 from .ui import quick_menu_keyboard
 
@@ -49,13 +52,23 @@ class MediaStore(Protocol):
 class DeferredReply:
     _store: ReplyStore
     _file_name: str
+    _public_url: str
+    _send_result: Callable[[ConversationResult, str | None], Awaitable[int]]
 
     async def publish(self, content: str) -> None:
         progress = content.strip() or "任务仍在处理中。"
         await self._replace(f"{DEFERRED_PROGRESS_HEADING}\n\n{progress}", pending=True)
 
     async def finish(self, result: ConversationResult) -> None:
-        await self._replace(_complete_text(result), pending=False)
+        full_reply_url = self._public_url
+        try:
+            await self._replace(_complete_text(result), pending=False)
+        except Exception as exc:
+            logger.warning(
+                "event=deferred_reply_update_failed error_type=%s", type(exc).__name__
+            )
+            full_reply_url = None
+        await self._send_result(result, full_reply_url)
 
     async def fail(self, content: str) -> None:
         await self._replace(content.strip(), pending=False)
@@ -87,15 +100,37 @@ class ConversationReplySender:
     ) -> DeferredReply:
         exported = await self._reply_store.create_pending(DEFERRED_INITIAL_TEXT)
         mention = f"<@{member_openid}> " if member_openid else ""
-        await self._sender.send_markdown_reply(
-            group_id=group_id,
-            source_message_id=source_message_id,
-            content=mention + DEFERRED_NOTICE_TEXT,
-            msg_seq=first_msg_seq,
-            keyboard=quick_menu_keyboard(full_reply_url=exported.public_url),
-            record_content=DEFERRED_NOTICE_TEXT,
+        try:
+            await self._sender.send_markdown_reply(
+                group_id=group_id,
+                source_message_id=source_message_id,
+                content=mention + DEFERRED_NOTICE_TEXT,
+                msg_seq=first_msg_seq,
+                keyboard=quick_menu_keyboard(full_reply_url=exported.public_url),
+                record_content=DEFERRED_NOTICE_TEXT,
+                fallback_member_openid=member_openid,
+            )
+        except Exception as exc:
+            # The final result still has to be delivered if this notice fails.
+            logger.warning(
+                "event=deferred_reply_notice_failed error_type=%s", type(exc).__name__
+            )
+
+        async def send_result(
+            result: ConversationResult, full_reply_url: str | None
+        ) -> int:
+            return await self.send(
+                result,
+                group_id=group_id,
+                source_message_id=source_message_id,
+                member_openid=member_openid,
+                first_msg_seq=first_msg_seq + 1,
+                full_reply_url=full_reply_url,
+            )
+
+        return DeferredReply(
+            self._reply_store, exported.file_name, exported.public_url, send_result
         )
-        return DeferredReply(self._reply_store, exported.file_name)
 
     async def send(
         self,
@@ -106,20 +141,39 @@ class ConversationReplySender:
         member_openid: str,
         first_msg_seq: int,
         keyboard_factory: Callable[[str | None], Mapping[str, Any]] | None = None,
+        full_reply_url: str | None = None,
     ) -> int:
-        complete_text = _complete_text(result)
-        display_text = complete_text
-        full_reply_url = None
-        if len(complete_text) > LONG_REPLY_THRESHOLD:
-            display_text = result.summary.strip()
+        # Keep completed image bytes in temporary storage even if QQ rejects text.
+        prepared_images: list[tuple[str, str, dict[str, Any]] | None] = []
+        for image in result.images:
             try:
-                exported = await self._reply_store.save(complete_text)
-                full_reply_url = exported.public_url
+                prepared_image = await asyncio.to_thread(prepare_qq_image, image)
+                exported = await self._media_store.save(prepared_image)
+                metadata = {
+                    "source": {**_image_metadata(image), "provenance": dict(result.image_provenance)},
+                    "delivery": _image_metadata(prepared_image),
+                    "compressed": prepared_image.data != image.data,
+                }
+                prepared_images.append((exported.public_url, prepared_image.mime_type, metadata))
             except Exception as exc:
                 logger.warning(
-                    "event=full_reply_store_failed error_type=%s", type(exc).__name__
+                    "event=qq_image_delivery_failed error_type=%s", type(exc).__name__
                 )
-                display_text += f"\n\n{FULL_REPLY_UNAVAILABLE_TEXT}"
+                prepared_images.append(None)
+
+        complete_text = _complete_text(result)
+        display_text = complete_text
+        if len(complete_text) > LONG_REPLY_THRESHOLD:
+            display_text = result.summary.strip()
+            if full_reply_url is None:
+                try:
+                    exported = await self._reply_store.save(complete_text)
+                    full_reply_url = exported.public_url
+                except Exception as exc:
+                    logger.warning(
+                        "event=full_reply_store_failed error_type=%s", type(exc).__name__
+                    )
+                    display_text += f"\n\n{FULL_REPLY_UNAVAILABLE_TEXT}"
 
         mention = f"<@{member_openid}> " if member_openid else ""
         keyboard = (
@@ -134,31 +188,47 @@ class ConversationReplySender:
             msg_seq=first_msg_seq,
             keyboard=keyboard,
             record_content=complete_text,
+            fallback_member_openid=member_openid,
         )
         next_sequence = first_msg_seq + 1
 
-        for image in result.images:
-            try:
-                exported = await self._media_store.save(image)
-                await self._sender.send_image_reply(
-                    group_id=group_id,
-                    source_message_id=source_message_id,
-                    public_url=exported.public_url,
-                    mime_type=image.mime_type,
-                    msg_seq=next_sequence,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "event=qq_image_delivery_failed error_type=%s", type(exc).__name__
-                )
+        for prepared in prepared_images:
+            delivered = False
+            if prepared is not None:
+                public_url, mime_type, metadata = prepared
+                try:
+                    await self._sender.send_image_reply(
+                        group_id=group_id,
+                        source_message_id=source_message_id,
+                        public_url=public_url,
+                        mime_type=mime_type,
+                        msg_seq=next_sequence,
+                        fallback_member_openid=member_openid,
+                        image_metadata=metadata,
+                    )
+                    delivered = True
+                except Exception as exc:
+                    logger.warning(
+                        "event=qq_image_delivery_failed error_type=%s", type(exc).__name__
+                    )
+            if not delivered:
                 await self._sender.send_text_reply(
                     group_id=group_id,
                     source_message_id=source_message_id,
                     content=IMAGE_DELIVERY_FAILED_TEXT,
                     msg_seq=next_sequence,
+                    fallback_member_openid=member_openid,
                 )
             next_sequence += 1
         return next_sequence
+
+
+def _image_metadata(image: ImageAsset) -> dict[str, Any]:
+    return {
+        "width": image.width, "height": image.height,
+        "size": len(image.data), "content_type": image.mime_type,
+        "sha256": hashlib.sha256(image.data).hexdigest(),
+    }
 
 
 def _complete_text(result: ConversationResult) -> str:

@@ -1,8 +1,10 @@
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import Callable
 
 import aiosqlite
 
@@ -10,6 +12,7 @@ from ai_service import env_int
 
 
 MAX_IMAGE_PROMPT_CHARS = 2000
+IMAGE_CONTINUATION_TTL_SECONDS = 15 * 60
 
 
 @dataclass(frozen=True)
@@ -17,6 +20,34 @@ class UsageDecision:
     allowed: bool
     message: str = ""
 
+
+class RecentImageRequestStore:
+    """Tracks short-lived chat image context without persisting conversations."""
+
+    def __init__(
+        self,
+        ttl_seconds: int = IMAGE_CONTINUATION_TTL_SECONDS,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._expires_at: dict[str, float] = {}
+
+    def has_context(self, conversation_key: str) -> bool:
+        expires_at = self._expires_at.get(conversation_key)
+        if expires_at is None:
+            return False
+        if expires_at <= self._clock():
+            self._expires_at.pop(conversation_key, None)
+            return False
+        return True
+
+    def mark(self, conversation_key: str) -> None:
+        self._expires_at[conversation_key] = self._clock() + self.ttl_seconds
+
+    def clear(self) -> None:
+        self._expires_at.clear()
 
 class ImageUsageStore:
     def __init__(
@@ -32,9 +63,17 @@ class ImageUsageStore:
 
     @classmethod
     def from_env(cls) -> "ImageUsageStore":
+        limit_name = (
+            "AIQQ_IMAGE_USER_DAILY_LIMIT"
+            if os.getenv("AIQQ_IMAGE_USER_DAILY_LIMIT", "").strip()
+            else "AIQQ_NOVELAI_USER_DAILY_LIMIT"
+        )
         return cls(
-            os.getenv("AIQQ_MEMORY_DB", "/var/lib/aiqq/memory.db").strip(),
-            daily_limit=env_int("AIQQ_NOVELAI_USER_DAILY_LIMIT", 100, 1, 100),
+            os.getenv(
+                "AIQQ_STATE_DB",
+                os.getenv("AIQQ_MEMORY_DB", "/var/lib/aiqq/state.db"),
+            ).strip(),
+            daily_limit=env_int(limit_name, 100, 1, 100),
         )
 
     async def initialize(self) -> None:
@@ -57,7 +96,7 @@ class ImageUsageStore:
             if self._active_conversation_key is not None:
                 return UsageDecision(
                     False,
-                    "当前已有图片正在生成，请等待它完成或超时后再试。",
+                    "主人，上一张还在画，请等它完成或超时后再试喵。",
                 )
 
             today = date.today().isoformat()
@@ -74,7 +113,7 @@ class ImageUsageStore:
             if row and int(row[0]) >= self.daily_limit:
                 return UsageDecision(
                     False,
-                    f"你今天的 NovelAI 生图额度已用完（每日 {self.daily_limit} 张）。",
+                    f"主人，今天的生图额度用完啦（每日 {self.daily_limit} 张），明天再来喵。",
                 )
 
             self._active_conversation_key = conversation_key

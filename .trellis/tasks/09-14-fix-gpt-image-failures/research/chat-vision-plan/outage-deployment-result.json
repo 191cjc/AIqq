@@ -1,0 +1,26 @@
+{
+  "service": {
+    "MainPID": "1308272",
+    "ExecMainStartTimestamp": "Wed 2026-09-16 16:33:04 CST",
+    "UMask": "0077",
+    "ActiveState": "active"
+  },
+  "old_messages_preserved_exactly": 816,
+  "current_message_count": 817,
+  "configuration_unchanged": true,
+  "repair_sources_unchanged_since_review": true,
+  "qq_connected": true,
+  "novelai_ready": true,
+  "storage": {
+    "group_message_events": 9,
+    "message_versions": 817,
+    "message_attachments": 128,
+    "unprojected_events": 0,
+    "write_failures": 0
+  },
+  "unit_tests": 265,
+  "production_sandbox_runtime_tests": 12,
+  "production_sandbox_live_vision": "outage-live-result.json",
+  "manual_qq_send": false,
+  "historical_request_replay": false
+}

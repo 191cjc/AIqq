@@ -1,0 +1,17 @@
+{
+  "model": "gpt-6-astra",
+  "success": true,
+  "image_sources_read": 2,
+  "answer": "1：COPPER 7429\n2：ORBIT 3816",
+  "elapsed_seconds": 27.52,
+  "generation_requested": false,
+  "work_turns_remaining": 0,
+  "runtime_turns_remaining": 0,
+  "production_feature_flags": {
+    "web_search": true,
+    "gpt_image_skill": true
+  },
+  "verification": "actual CodexSDKBackend and ChatAgent, synthetic repository/cards, full production systemd restrictions including UMask0077",
+  "qq_send": false,
+  "production_db_write": false
+}

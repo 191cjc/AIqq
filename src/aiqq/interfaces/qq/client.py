@@ -36,7 +36,8 @@ class GatewayMessageRepository(Protocol):
     def is_open(self) -> bool: ...
 
     async def add_gateway_event(
-        self, event_type: str, gateway_payload: dict[str, Any]
+        self, event_type: str, gateway_payload: dict[str, Any],
+        *, raw_text: str | None = None, connection_id: str = "",
     ) -> bool: ...
 
 
@@ -72,6 +73,7 @@ class AiQQClient(botpy.Client):
         self._initialized = False
         self._web_runner: web.AppRunner | None = None
         self._gateway_watchdog: asyncio.Task[None] | None = None
+        self._message_tasks: set[asyncio.Task[bool]] = set()
 
     async def bot_connect(self, session: Any) -> None:
         socket = MonitoredBotWebSocket(
@@ -119,12 +121,15 @@ class AiQQClient(botpy.Client):
         logger.info("event=qq_full_group_messages_disabled")
 
     async def _handle_raw_group_message(
-        self, event_type: str, payload: dict[str, Any]
+        self, event_type: str, payload: dict[str, Any],
+        *, raw_text: str | None = None, connection_id: str = "",
     ) -> None:
         try:
-            saved = await self._components.group_messages.add_gateway_event(
-                event_type, payload
+            raw_options = (
+                {"raw_text": raw_text, "connection_id": connection_id}
+                if raw_text is not None else {}
             )
+            saved = await self._components.group_messages.add_gateway_event(event_type, payload, **raw_options)
         except Exception as exc:
             logger.warning(
                 "event=group_message_record_failed event_type=%s error_type=%s",
@@ -134,13 +139,29 @@ class AiQQClient(botpy.Client):
             saved = False
         if not saved:
             return
-        if event_type != "GROUP_MESSAGE_CREATE" or not raw_event_mentions_bot(payload):
+        if event_type not in {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
+            return
+        if event_type == "GROUP_MESSAGE_CREATE" and not raw_event_mentions_bot(payload):
             return
         data = normalized_group_message_data(payload)
         if data is None:
             return
         message = GroupMessage(self.api, payload.get("id"), data)
-        await self._components.message_handler.handle(_incoming(message))
+        # Persist before dispatch, but never block gateway capture while a model
+        # turn is running. The handler owns shared raw/SDK group+message dedup.
+        task = asyncio.create_task(
+            self._components.message_handler.handle(_incoming(message, raw_data=data)),
+            name="aiqq-group-message",
+        )
+        self._message_tasks.add(task)
+        task.add_done_callback(self._message_finished)
+
+    def _message_finished(self, task: asyncio.Task[bool]) -> None:
+        self._message_tasks.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.warning("event=group_message_dispatch_failed error_type=%s", type(error).__name__)
 
     def _mark_gateway_connected(self, resumed: bool) -> None:
         self.gateway_status.mark_connected(resumed=resumed)
@@ -192,6 +213,10 @@ class AiQQClient(botpy.Client):
         self._gateway_watchdog = None
         if watchdog is not None and not watchdog.done():
             watchdog.cancel()
+        message_tasks = tuple(self._message_tasks)
+        for task in message_tasks:
+            task.cancel()
+        await asyncio.gather(*message_tasks, return_exceptions=True)
         if self._web_runner is not None:
             await self._web_runner.cleanup()
             self._web_runner = None
@@ -208,11 +233,25 @@ class AiQQClient(botpy.Client):
         await super().close()
 
 
-def _incoming(message: GroupMessage) -> IncomingGroupMessage:
+def _incoming(message: GroupMessage, *, raw_data: dict[str, Any] | None = None) -> IncomingGroupMessage:
     author = getattr(message, "author", None)
     return IncomingGroupMessage(
         group_id=str(getattr(message, "group_openid", "") or ""),
         message_id=str(getattr(message, "id", "") or ""),
         member_openid=str(getattr(author, "member_openid", "") or ""),
         content=str(getattr(message, "content", "") or ""),
+        has_attachments=bool(getattr(message, "attachments", None)) or _has_attachments(raw_data),
     )
+
+
+def _has_attachments(value: Any) -> bool:
+    if isinstance(value, dict):
+        if value.get("attachments"):
+            return True
+        content_type = value.get("content_type")
+        if isinstance(content_type, str) and content_type.lower().startswith("image/"):
+            return True
+        return any(_has_attachments(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_attachments(item) for item in value)
+    return False

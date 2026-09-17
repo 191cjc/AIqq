@@ -1,0 +1,104 @@
+{
+  "protocol_version": 3,
+  "operation": "chat",
+  "current_message": {
+    "record_id": 502,
+    "message_id": "message_demo_502",
+    "event_id": "event_demo_502",
+    "event_type": "GROUP_AT_MESSAGE_CREATE",
+    "group_openid": "group_demo",
+    "member_openid": "member_demo_b",
+    "username": "成员乙",
+    "member_role": "member",
+    "is_bot": 0,
+    "content": "<@!bot_demo> 刚才那张表情包是什么意思？",
+    "message_type": 0,
+    "sent_at": "2026-09-16T11:44:00+08:00",
+    "received_at": "2026-09-16T03:44:00.500+00:00",
+    "payload": {
+      "id": "message_demo_502",
+      "group_openid": "group_demo",
+      "author": {
+        "member_openid": "member_demo_b",
+        "username": "成员乙",
+        "member_role": "member"
+      },
+      "content": "<@!bot_demo> 刚才那张表情包是什么意思？",
+      "message_type": 0,
+      "timestamp": "2026-09-16T11:44:00+08:00",
+      "attachments": [],
+      "mentions": [
+        {
+          "id": "bot_demo",
+          "is_you": true
+        }
+      ],
+      "msg_elements": []
+    },
+    "recalled_at": ""
+  },
+  "reference_material": {
+    "available": true,
+    "scope": {
+      "message_limit": 50,
+      "included_message_count": 1,
+      "first_record_id": 501,
+      "last_record_id": 501,
+      "has_older_messages": true,
+      "content_complete": true,
+      "char_limit": null
+    },
+    "group_messages": [
+      {
+        "record_id": 501,
+        "message_id": "message_demo_501",
+        "event_id": "event_demo_501",
+        "event_type": "GROUP_MESSAGE_CREATE",
+        "group_openid": "group_demo",
+        "member_openid": "member_demo_a",
+        "username": "成员甲",
+        "member_role": "member",
+        "is_bot": 0,
+        "content": "这张表情包太有意思了\n<faceType=6,faceId=\"0\",ext=\"eyJ0ZXh0IjoiIn0=\">",
+        "message_type": 0,
+        "sent_at": "2026-09-16T11:43:48+08:00",
+        "received_at": "2026-09-16T03:43:48.500+00:00",
+        "payload": {
+          "id": "message_demo_501",
+          "group_openid": "group_demo",
+          "author": {
+            "member_openid": "member_demo_a",
+            "username": "成员甲",
+            "member_role": "member"
+          },
+          "content": "这张表情包太有意思了\n<faceType=6,faceId=\"0\",ext=\"eyJ0ZXh0IjoiIn0=\">",
+          "message_type": 0,
+          "timestamp": "2026-09-16T11:43:48+08:00",
+          "attachments": [
+            {
+              "url": "https://example.invalid/meme.jpg?signature=PLACEHOLDER",
+              "filename": "meme.jpg",
+              "content_type": "image/jpeg",
+              "width": 1079,
+              "height": 1081,
+              "size": 65831
+            }
+          ],
+          "msg_elements": []
+        },
+        "recalled_at": ""
+      }
+    ]
+  },
+  "user_input": "刚才那张表情包是什么意思？",
+  "visual_context": {
+    "sources": [
+      {
+        "record_id": 501,
+        "attachment_index": 0,
+        "status": "not_loaded"
+      }
+    ],
+    "loaded_sources": []
+  }
+}

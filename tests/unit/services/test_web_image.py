@@ -1,7 +1,9 @@
 import asyncio
 import unittest
 from io import BytesIO
+from unittest.mock import patch
 
+import aiohttp
 from PIL import Image
 
 from aiqq.services.images.web import (
@@ -139,8 +141,10 @@ class WebImageServiceTests(unittest.IsolatedAsyncioTestCase):
                     return session
 
                 service._get_session = get_session
-                with self.assertRaises(WebImageError):
+                with self.assertRaises(WebImageError) as caught:
                     await service.download("https://images.example/item.png")
+                self.assertEqual(caught.exception.kind, "invalid_image")
+                self.assertEqual(caught.exception.status_code, 200)
 
     async def test_total_timeout_is_an_error(self):
         service = WebImageService(timeout_seconds=1)
@@ -149,8 +153,92 @@ class WebImageServiceTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(2)
 
         service._download = slow_download
-        with self.assertRaisesRegex(WebImageError, "timed out"):
+        with self.assertRaisesRegex(WebImageError, "timed out") as caught:
             await service.download("https://images.example/item.png")
+        self.assertEqual(caught.exception.kind, "timeout")
+
+    async def test_http_failures_preserve_kind_and_status_without_response_body(self):
+        for status, kind in (
+            (404, "not_found"), (410, "not_found"),
+            (401, "access_denied"), (403, "access_denied"),
+            (429, "download_failed"), (500, "download_failed"),
+        ):
+            with self.subTest(status=status):
+                service = WebImageService()
+                session = FakeSession([FakeResponse(status=status, body=b"private body")])
+                with patch.object(service, "_get_session", return_value=session):
+                    with self.assertRaises(WebImageError) as caught:
+                        await service.download("https://images.example/item?token=secret")
+                self.assertEqual(caught.exception.kind, kind)
+                self.assertEqual(caught.exception.status_code, status)
+                self.assertNotIn("private", str(caught.exception))
+                self.assertNotIn("secret", str(caught.exception))
+                self.assertEqual(len(session.calls), 1)
+
+    async def test_client_timeouts_are_not_collapsed_into_oserror(self):
+        for failure in (TimeoutError("private URL"), aiohttp.ServerTimeoutError("secret")):
+            with self.subTest(failure=type(failure).__name__):
+                service = WebImageService()
+                session = FakeSession([])
+                with patch.object(service, "_get_session", return_value=session), \
+                     patch.object(session, "get", side_effect=failure):
+                    with self.assertRaises(WebImageError) as caught:
+                        await service.download("https://images.example/item.png")
+                self.assertEqual(caught.exception.kind, "timeout")
+                self.assertIsNone(caught.exception.status_code)
+                self.assertEqual(str(caught.exception), "web image download timed out")
+
+    async def test_stream_timeout_and_cancellation_keep_their_meaning(self):
+        for failure in (aiohttp.SocketTimeoutError("secret"), asyncio.CancelledError()):
+            with self.subTest(failure=type(failure).__name__):
+                response = FakeResponse(body=make_png())
+
+                async def failing_chunks(_size):
+                    yield b"partial"
+                    raise failure
+
+                response.content.iter_chunked = failing_chunks
+                service = WebImageService()
+                with patch.object(service, "_get_session", return_value=FakeSession([response])):
+                    if isinstance(failure, asyncio.CancelledError):
+                        with self.assertRaises(asyncio.CancelledError):
+                            await service.download("https://images.example/item.png")
+                    else:
+                        with self.assertRaises(WebImageError) as caught:
+                            await service.download("https://images.example/item.png")
+                        self.assertEqual(caught.exception.kind, "timeout")
+
+    async def test_size_limits_cover_declared_size_and_actual_stream(self):
+        image_bytes = make_png()
+        for response in (
+            FakeResponse(body=image_bytes, content_length=len(image_bytes) + 1),
+            FakeResponse(body=image_bytes + b"x", content_length=0),
+        ):
+            service = WebImageService()
+            with patch("aiqq.services.images.web.MAX_IMAGE_BYTES", len(image_bytes)), \
+                 patch.object(service, "_get_session", return_value=FakeSession([response])):
+                with self.assertRaises(WebImageError) as caught:
+                    await service.download("https://images.example/item.png")
+            self.assertEqual(caught.exception.kind, "too_large")
+
+    async def test_connection_and_url_policy_failures_do_not_claim_expiry(self):
+        service = WebImageService()
+        with self.assertRaises(WebImageError) as caught:
+            await service.download("https://127.0.0.1/expired.png")
+        self.assertEqual(caught.exception.kind, "download_failed")
+        session = FakeSession([])
+        with patch.object(service, "_get_session", return_value=session), \
+             patch.object(session, "get", side_effect=OSError("404 expired private URL")):
+            with self.assertRaises(WebImageError) as caught:
+                await service.download("https://images.example/item.png")
+        self.assertEqual(caught.exception.kind, "download_failed")
+        self.assertIsNone(caught.exception.status_code)
+
+    def test_legacy_error_constructor_still_has_safe_default(self):
+        error = WebImageError("legacy failure")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(error.kind, "download_failed")
+        self.assertIsNone(error.status_code)
 
 
 if __name__ == "__main__":

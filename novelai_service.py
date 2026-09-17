@@ -16,9 +16,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_MCP_URL = "https://www.fsstudy.com.cn/mcp"
 MCP_PROTOCOL_VERSION = "2025-06-18"
 NOVELAI_MODEL = "v4.5-full"
-NOVELAI_WIDTH = 1024
-NOVELAI_HEIGHT = 1024
+NOVELAI_IMAGE_SIZES = {
+    "square": (1024, 1024),
+    "portrait": (832, 1216),
+    "landscape": (1216, 832),
+}
 NOVELAI_STEPS = 28
+NOVELAI_CFG_RESCALE = 0.5
 NOVELAI_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 SAFE_PROMPT_PREFIX = "rating:general, safe, sfw"
 SAFE_NEGATIVE_PROMPT = (
@@ -282,21 +286,28 @@ class NovelAIService:
             logger.warning("NovelAI MCP 连接检查失败：%s", exc)
             return False
 
-    async def generate(self, prompt: str) -> GeneratedImage:
+    async def generate(
+        self, prompt: str, *, orientation: str = "square"
+    ) -> GeneratedImage:
         if not self.is_configured:
             raise NovelAIError("NovelAI 服务尚未配置。")
         if self._supports_steps is None:
             raise NovelAIError("NovelAI MCP 尚未完成能力检查。")
+        try:
+            width, height = NOVELAI_IMAGE_SIZES[orientation]
+        except KeyError as exc:
+            raise NovelAIError("NovelAI 图片方向参数不受支持。") from exc
 
         arguments: dict[str, Any] = {
             "prompt": f"{SAFE_PROMPT_PREFIX}, {prompt}",
             "negative_prompt": SAFE_NEGATIVE_PROMPT,
             "model": NOVELAI_MODEL,
-            "width": NOVELAI_WIDTH,
-            "height": NOVELAI_HEIGHT,
+            "width": width,
+            "height": height,
             "seed": None,
             "quality_toggle": False,
             "variety_boost": True,
+            "cfg_rescale": NOVELAI_CFG_RESCALE,
         }
         if self._supports_steps:
             arguments["steps"] = NOVELAI_STEPS

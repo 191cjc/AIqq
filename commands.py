@@ -1,4 +1,5 @@
 CLEAR_MEMORY_COMMAND = "清除记忆"
+GPT_IMAGE_COMMAND = "GPT生图"
 NOVELAI_IMAGE_COMMAND = "NovelAI生图"
 NOVELAI_PROMPT_COMMAND = "NovelAI提示词"
 NOVELAI_PROMPT_EDIT_COMMAND = "修改NovelAI提示词"
@@ -28,6 +29,18 @@ def extract_menu_suggestion(content: str) -> str | None:
 
 def extract_novelai_prompt(content: str) -> str | None:
     for command in (NOVELAI_IMAGE_COMMAND, f"/{NOVELAI_IMAGE_COMMAND}"):
+        if content == command:
+            return ""
+        if not content.startswith(command):
+            continue
+        suffix = content[len(command) :]
+        if suffix and suffix[0].isspace():
+            return suffix.strip()
+    return None
+
+
+def extract_gpt_image_prompt(content: str) -> str | None:
+    for command in (GPT_IMAGE_COMMAND, f"/{GPT_IMAGE_COMMAND}"):
         if content == command:
             return ""
         if not content.startswith(command):

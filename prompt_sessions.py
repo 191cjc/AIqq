@@ -26,7 +26,10 @@ class PromptSessionStore:
     @classmethod
     def from_env(cls) -> "PromptSessionStore":
         return cls(
-            os.getenv("AIQQ_MEMORY_DB", "/var/lib/aiqq/memory.db").strip()
+            os.getenv(
+                "AIQQ_STATE_DB",
+                os.getenv("AIQQ_MEMORY_DB", "/var/lib/aiqq/state.db"),
+            ).strip()
         )
 
     async def initialize(self) -> None:

@@ -12,7 +12,9 @@ image itself.
 - For an explicit request to create an image, use `mode="generate"`, write a complete
   standalone visual prompt, and set `source_record_id=null`.
 - For an explicit request to modify an available reference image, use `mode="edit"`
-  and select only a `record_id` whose supplied reference entry has `has_image=true`.
+  and select a real `record.record_id` from the current message, supplied history,
+  or a same-group history tool result with `derived.has_image=true` and no recalled
+  state. Older protocol entries may use top-level `record_id` and `has_image`.
 - Otherwise set `image_action=null`. Questions about images and requests to find an
   existing web image are not generation requests.
 - Never invent a record ID, local path, credential, QQ identifier, API parameter, or

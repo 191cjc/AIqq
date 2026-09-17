@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from aiqq.logic.ports import AgentTurnResult
 from aiqq.services.ai.codex_sdk import (
@@ -124,6 +124,33 @@ class CodexSDKBackendTests(unittest.IsolatedAsyncioTestCase):
         }
         values.update(overrides)
         return CodexSDKBackend(**values)
+
+    async def test_cli_initialization_failure_logs_safe_reason_without_stderr(self):
+        from openai_codex_sdk.errors import CodexExecError
+
+        for detail, reason in (
+            ("failed to initialize in-process app-server client: Operation not permitted (os error 1)",
+             "cli_initialization_permission_denied"),
+            ("unrecognized startup failure", "sdk_failure"),
+        ):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as root:
+                error = CodexExecError("Codex Exec exited with code 1: " + detail +
+                                       "\nprivate-prompt https://example.invalid/?token=secret")
+                sdk = _FakeSDK(())
+                backend = self.make_backend(root, sdk, codex_factory=Mock(side_effect=error))
+                try:
+                    with self.assertLogs("aiqq.services.ai.codex_sdk", level="WARNING") as logs:
+                        with self.assertRaises(CodexBackendError):
+                            await backend.run(instructions="chat", model_input="private-prompt",
+                                              output_schema=PROMPT_AUDIT_OUTPUT_SCHEMA)
+                    self.assertEqual(len(logs.output), 1)
+                    self.assertIn("error_type=CodexExecError reason=" + reason, logs.output[0])
+                    self.assertNotIn("private-prompt", logs.output[0])
+                    self.assertNotIn("token=secret", logs.output[0])
+                    self.assertFalse(list(Path(root, "runtime").iterdir()))
+                    self.assertFalse(list(Path(root, "work").iterdir()))
+                finally:
+                    await backend.close()
 
     async def test_image_mode_has_isolated_instructions_and_no_chat_tools(self):
         sdk = _FakeSDK((_successful_events(),))

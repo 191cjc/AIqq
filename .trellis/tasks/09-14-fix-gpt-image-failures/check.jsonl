@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/image-services.md", "reason": "Preserve existing GPT/NovelAI/reference/QQ compression/expiry delivery contracts"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "R11 spans gateway persistence, full records, tools and model visual input"}
+{"file": ".trellis/tasks/09-14-fix-gpt-image-failures/research/chat-vision-plan/prd.md", "reason": "Authorized R11 v4 current requirements; overrides historical plan-only status and obsolete image cache designs"}
+{"file": ".trellis/tasks/09-14-fix-gpt-image-failures/research/chat-vision-plan/design.md", "reason": "Authorized R11 v4 current requirements; overrides historical plan-only status and obsolete image cache designs"}
+{"file": ".trellis/tasks/09-14-fix-gpt-image-failures/research/chat-vision-plan/storage-design.md", "reason": "Authorized R11 v4 current requirements; overrides historical plan-only status and obsolete image cache designs"}
+{"file": ".trellis/tasks/09-14-fix-gpt-image-failures/research/chat-vision-plan/implement.md", "reason": "Authorized R11 v4 current requirements; overrides historical plan-only status and obsolete image cache designs"}
+{"file": ".trellis/spec/backend/chat-read.md", "reason": "Implemented R11 full-row/event/version/history/vision/error/isolation contracts and rollback constraints"}

@@ -3,6 +3,8 @@ import unittest
 from panel_service import (
     CLEAR_MEMORY_COMMAND,
     CLEAR_MEMORY_DESCRIPTION,
+    GPT_IMAGE_COMMAND,
+    GPT_IMAGE_DESCRIPTION,
     MENU_COMMAND,
     MENU_DESCRIPTION,
     NOVELAI_IMAGE_COMMAND,
@@ -61,6 +63,15 @@ def prompt_command_item():
     }
 
 
+def gpt_image_command_item():
+    return {
+        "type": "command",
+        "name": GPT_IMAGE_COMMAND,
+        "desc": GPT_IMAGE_DESCRIPTION,
+        "only_admin": False,
+    }
+
+
 def menu_command_item():
     return {
         "type": "command",
@@ -94,6 +105,7 @@ class PanelServiceTests(unittest.IsolatedAsyncioTestCase):
                             command_item(),
                             prompt_command_item(),
                             image_command_item(),
+                            gpt_image_command_item(),
                         ],
                         "remark": PANEL_REMARK,
                     },
@@ -114,6 +126,7 @@ class PanelServiceTests(unittest.IsolatedAsyncioTestCase):
                                 command_item(),
                                 prompt_command_item(),
                                 image_command_item(),
+                                gpt_image_command_item(),
                             ],
                             "remark": PANEL_REMARK,
                         },
@@ -156,6 +169,7 @@ class PanelServiceTests(unittest.IsolatedAsyncioTestCase):
                 command_item(),
                 prompt_command_item(),
                 image_command_item(),
+                gpt_image_command_item(),
             ],
         )
 
@@ -193,6 +207,7 @@ class PanelServiceTests(unittest.IsolatedAsyncioTestCase):
                     menu_command_item(),
                     prompt_command_item(),
                     image_command_item(),
+                    gpt_image_command_item(),
                 ],
                 "remark": "已有面板",
             },

@@ -88,7 +88,10 @@ class GPTImageWorkflow:
         finally:
             await self._image_usage.finish_attempt(conversation_key)
         text = "图片已经生成完成。"
-        return ConversationResult("ok", text, text, images=(image,))
+        return ConversationResult(
+            "ok", text, text, images=(image,),
+            image_provenance={"provider": "gpt", "operation": "generate"},
+        )
 
 
 def image_failure_result(error: ImageGenerationUnavailable) -> ConversationResult:

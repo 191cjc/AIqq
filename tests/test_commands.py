@@ -2,6 +2,7 @@ import unittest
 
 from commands import (
     MEMORY_CLEAR_COMMANDS,
+    extract_gpt_image_prompt,
     extract_menu_suggestion,
     extract_novelai_prompt,
     extract_novelai_prompt_edit_request,
@@ -35,6 +36,17 @@ class CommandTests(unittest.TestCase):
             "silver hair, blue eyes",
         )
         self.assertEqual(extract_novelai_prompt("/NovelAI生图"), "")
+
+    def test_gpt_image_command_accepts_chinese_description(self):
+        self.assertEqual(
+            extract_gpt_image_prompt("GPT生图 雨夜霓虹街道上的白猫"),
+            "雨夜霓虹街道上的白猫",
+        )
+        self.assertEqual(
+            extract_gpt_image_prompt("/GPT生图 水彩风格的山间小屋"),
+            "水彩风格的山间小屋",
+        )
+        self.assertEqual(extract_gpt_image_prompt("/GPT生图"), "")
 
     def test_panel_slash_clear_memory_command_is_recognized(self):
         self.assertIn("/清除记忆", MEMORY_CLEAR_COMMANDS)
@@ -71,6 +83,8 @@ class CommandTests(unittest.TestCase):
         self.assertIsNone(extract_novelai_prompt("NovelAI生图测试"))
         self.assertIsNone(extract_novelai_prompt("/NovelAI生图测试"))
         self.assertIsNone(extract_novelai_prompt("请NovelAI生图"))
+        self.assertIsNone(extract_gpt_image_prompt("GPT生图测试"))
+        self.assertIsNone(extract_gpt_image_prompt("请GPT生图"))
         self.assertIsNone(extract_novelai_prompt_request("NovelAI提示词测试"))
         self.assertIsNone(extract_novelai_prompt_request("请NovelAI提示词"))
         self.assertIsNone(

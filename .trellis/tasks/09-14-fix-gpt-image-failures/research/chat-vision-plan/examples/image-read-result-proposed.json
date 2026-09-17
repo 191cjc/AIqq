@@ -1,0 +1,14 @@
+{
+  "status": "ok",
+  "record_id": 501,
+  "attachment_index": 0,
+  "images": [
+    {
+      "path": "/turn-example/input-images/record-501-0.jpg",
+      "mime_type": "image/jpeg",
+      "width": 1079,
+      "height": 1081
+    }
+  ],
+  "viewed": false
+}

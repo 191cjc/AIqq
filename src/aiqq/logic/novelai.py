@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import logging
 
-from aiqq.exceptions import ImageAuditUnavailable, NovelAIPromptUnavailable
+from aiqq.exceptions import (
+    ImageAuditUnavailable,
+    ImageGenerationUnavailable,
+    NovelAIPromptUnavailable,
+)
 
 from .image_generation import _quota_denied
 from .models import (
@@ -28,6 +32,10 @@ NOVELAI_PROMPT_USAGE = "请在 /NovelAI提示词 后写明想要的画面。"
 NOVELAI_PROMPT_EDIT_USAGE = "请通过提示词方案中的修改按钮填写修改要求。"
 NOVELAI_AUDIT_UNAVAILABLE = "图片审核服务暂时不可用，请稍后再试。"
 NOVELAI_GENERATION_UNAVAILABLE = "NovelAI 图片生成暂时不可用，请稍后再试。"
+NOVELAI_GENERATION_ERRORS = {
+    "not_configured": "NovelAI 生图服务未配置，请联系管理员。",
+    "not_ready": "NovelAI 生图服务连接未就绪，请稍后再试。",
+}
 NOVELAI_PROMPT_UNAVAILABLE = "NovelAI 提示词服务暂时不可用，请稍后再试。"
 NOVELAI_SESSION_EXPIRED = "这次提示词修改已过期，请重新生成提示词方案。"
 
@@ -77,6 +85,14 @@ class NovelAIImageWorkflow:
                 normalized, orientation=audit.orientation
             )
             await self._image_usage.record_success(conversation_key)
+        except ImageGenerationUnavailable as exc:
+            kind = exc.kind if exc.kind in NOVELAI_GENERATION_ERRORS else "unknown"
+            logger.warning("event=novelai_generation_failed error_kind=%s", kind)
+            return _unavailable(
+                NOVELAI_GENERATION_ERRORS.get(kind, NOVELAI_GENERATION_UNAVAILABLE),
+                f"novelai_service_{kind}"
+                if kind != "unknown" else "novelai_generation_unavailable",
+            )
         except Exception as exc:
             logger.warning(
                 "event=novelai_generation_failed error_type=%s", type(exc).__name__
@@ -87,7 +103,10 @@ class NovelAIImageWorkflow:
         finally:
             await self._image_usage.finish_attempt(conversation_key)
         text = "NovelAI 图片已经生成完成。"
-        return ConversationResult("ok", text, text, images=(image,))
+        return ConversationResult(
+            "ok", text, text, images=(image,),
+            image_provenance={"provider": "novelai", "operation": "generate"},
+        )
 
 
 class NovelAIPromptWorkflow:

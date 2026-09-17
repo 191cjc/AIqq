@@ -32,6 +32,7 @@ class HealthAndWebApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["conversation_context"], "group_history_reference")
         self.assertFalse(payload["shared_ai_thread"])
         self.assertFalse(payload["private_chat_enabled"])
+        self.assertEqual(payload["novelai"], {"configured": False, "ready": False})
 
         degraded = HealthHandler(
             gateway_snapshot=lambda: {"connected": False},
@@ -39,6 +40,27 @@ class HealthAndWebApplicationTests(unittest.IsolatedAsyncioTestCase):
             ai_backend="responses",
         )
         self.assertEqual((await degraded.serve(None)).status, 503)
+
+    async def test_novelai_snapshot_is_fresh_and_exposes_only_status_booleans(self):
+        snapshot = {"configured": True, "ready": False, "token": "private-secret"}
+        handler = HealthHandler(
+            gateway_snapshot=lambda: {"connected": True},
+            database_is_open=lambda: True,
+            ai_backend="codex_sdk",
+            novelai_snapshot=lambda: snapshot,
+        )
+        response = await handler.serve(None)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            json.loads(response.text)["novelai"], {"configured": True, "ready": False}
+        )
+        self.assertNotIn("private-secret", response.text)
+
+        snapshot["ready"] = True
+        response = await handler.serve(None)
+        self.assertEqual(
+            json.loads(response.text)["novelai"], {"configured": True, "ready": True}
+        )
 
     async def test_complete_web_application_registers_all_operational_routes(self):
         handler = StubHandler()

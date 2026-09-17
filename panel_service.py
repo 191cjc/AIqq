@@ -5,6 +5,7 @@ from botpy.http import Route
 
 from commands import (
     CLEAR_MEMORY_COMMAND,
+    GPT_IMAGE_COMMAND,
     MENU_COMMAND,
     NOVELAI_IMAGE_COMMAND,
     NOVELAI_PROMPT_COMMAND,
@@ -16,6 +17,7 @@ PANEL_REMARK = "AiQQ 群聊指令面板"
 CLEAR_MEMORY_DESCRIPTION = "清除你的对话上下文"
 NOVELAI_IMAGE_DESCRIPTION = "输入提示词生成图片"
 NOVELAI_PROMPT_DESCRIPTION = "将画面描述转换为生图提示词"
+GPT_IMAGE_DESCRIPTION = "用 GPT 根据画面描述生成图片"
 MENU_DESCRIPTION = "打开机器人快捷功能菜单"
 
 
@@ -43,6 +45,12 @@ def _command_items() -> list[dict[str, Any]]:
             "type": "command",
             "name": NOVELAI_IMAGE_COMMAND,
             "desc": NOVELAI_IMAGE_DESCRIPTION,
+            "only_admin": False,
+        },
+        {
+            "type": "command",
+            "name": GPT_IMAGE_COMMAND,
+            "desc": GPT_IMAGE_DESCRIPTION,
             "only_admin": False,
         },
     ]
@@ -74,6 +82,7 @@ def _is_managed_command_item(item: Any) -> bool:
             CLEAR_MEMORY_COMMAND,
             NOVELAI_IMAGE_COMMAND,
             NOVELAI_PROMPT_COMMAND,
+            GPT_IMAGE_COMMAND,
         }
     )
 

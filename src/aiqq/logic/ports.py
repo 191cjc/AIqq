@@ -2,7 +2,10 @@
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from .chat_read import ChatReadSession
 
 from .models import (
     BotSentGroupMessage,
@@ -41,6 +44,7 @@ class AIBackend(Protocol):
         enable_gpt_image_skill: bool = False,
         on_progress: ProgressCallback | None = None,
         input_images: Sequence[ImageAsset] = (),
+        chat_read_session: "ChatReadSession | None" = None,
     ) -> AgentTurnResult: ...
 
 
@@ -58,6 +62,12 @@ class ConversationAgent(Protocol):
 
 
 class GroupHistoryRepository(Protocol):
+    async def get_current_for_reference(
+        self, group_id: str, message_id: str
+    ) -> GroupHistoryMessage | None: ...
+
+    async def has_before(self, group_id: str, record_id: int) -> bool: ...
+
     async def list_for_reference(
         self,
         group_id: str,
@@ -68,6 +78,8 @@ class GroupHistoryRepository(Protocol):
 
 
 class ReferenceImageLoader(Protocol):
+    """Load a reference or raise ReferenceImageUnavailable; None means missing."""
+
     async def load(self, group_id: str, record_id: int) -> ImageAsset | None: ...
 
 
@@ -135,6 +147,12 @@ class WebImageService(Protocol):
 
 
 class BotMessageRepository(Protocol):
+    async def record_delivery_attempt(
+        self, *, group_id: str, source_message_id: str = "",
+        operation: str, status: str, parameters: dict[str, Any],
+        result: Any = None, error_type: str = "", message_id: str = "",
+    ) -> int: ...
+
     async def add_bot_message(
         self,
         *,
@@ -183,6 +201,7 @@ class GroupMessageSender(Protocol):
         msg_seq: int,
         progress: bool = False,
         origin: str = "conversation",
+        fallback_member_openid: str = "",
     ) -> BotSentGroupMessage: ...
 
     async def send_markdown_reply(
@@ -195,6 +214,7 @@ class GroupMessageSender(Protocol):
         keyboard: Mapping[str, Any] | None = None,
         record_content: str | None = None,
         origin: str = "conversation",
+        fallback_member_openid: str = "",
     ) -> BotSentGroupMessage: ...
 
     async def send_image_reply(
@@ -206,6 +226,8 @@ class GroupMessageSender(Protocol):
         mime_type: str,
         msg_seq: int,
         origin: str = "conversation",
+        fallback_member_openid: str = "",
+        image_metadata: Mapping[str, Any] | None = None,
     ) -> BotSentGroupMessage: ...
 
     async def recall_from_group(self, target: BotSentGroupMessage) -> bool: ...

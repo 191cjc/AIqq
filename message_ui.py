@@ -3,6 +3,7 @@ from typing import Any
 
 from commands import (
     CLEAR_MEMORY_COMMAND,
+    GPT_IMAGE_COMMAND,
     MENU_COMMAND,
     NOVELAI_IMAGE_COMMAND,
     NOVELAI_PROMPT_EDIT_COMMAND,
@@ -89,19 +90,46 @@ def _full_reply_button_row(full_reply_url: str) -> dict[str, Any]:
     }
 
 
+def _image_suggestion_button_row(
+    command: str,
+    suggestion: str,
+    *,
+    button_id: str,
+) -> dict[str, Any]:
+    safe_suggestion = " ".join(suggestion.split()).strip()[:500]
+    return {
+        "buttons": [
+            {
+                "id": button_id,
+                "render_data": {
+                    "label": "🟢 使用建议",
+                    "visited_label": "🟢 使用建议",
+                    "style": 0,
+                },
+                "action": {
+                    "type": 2,
+                    "permission": {"type": 2},
+                    "data": f"{command} {safe_suggestion}",
+                    "enter": False,
+                },
+            }
+        ]
+    }
+
+
 def quick_menu_keyboard(
     *,
     novelai_suggestion: str | None = None,
+    gpt_suggestion: str | None = None,
     novelai_prompt_request: str | None = None,
     full_reply_url: str | None = None,
 ) -> dict[str, Any]:
     suggestion = (novelai_suggestion or "").strip()[:500]
+    safe_gpt_suggestion = (gpt_suggestion or "").strip()[:500]
     prompt_request = " ".join((novelai_prompt_request or "").split())[:500]
     action_data = f"/{MENU_COMMAND}"
     if prompt_request:
         action_data += f" {NOVELAI_PROMPT_COMMAND} {prompt_request}"
-    elif suggestion:
-        action_data += f" {suggestion}"
     rows = [
         {
             "buttons": [
@@ -122,6 +150,22 @@ def quick_menu_keyboard(
             ]
         }
     ]
+    if suggestion:
+        rows.append(
+            _image_suggestion_button_row(
+                NOVELAI_IMAGE_COMMAND,
+                suggestion,
+                button_id="use_novelai_suggestion",
+            )
+        )
+    if safe_gpt_suggestion:
+        rows.append(
+            _image_suggestion_button_row(
+                GPT_IMAGE_COMMAND,
+                safe_gpt_suggestion,
+                button_id="use_gpt_suggestion",
+            )
+        )
     if full_reply_url:
         rows.append(_full_reply_button_row(full_reply_url))
     return {"content": {"rows": rows}}
@@ -243,6 +287,24 @@ def feature_menu_keyboard(
                 }
             ]
         },
+        {
+            "buttons": [
+                {
+                    "id": "gpt_image",
+                    "render_data": {
+                        "label": GPT_IMAGE_COMMAND,
+                        "visited_label": GPT_IMAGE_COMMAND,
+                        "style": 1,
+                    },
+                    "action": {
+                        "type": 2,
+                        "permission": {"type": 2},
+                        "data": GPT_IMAGE_COMMAND,
+                        "enter": False,
+                    },
+                }
+            ]
+        },
     ]
     prompt_request = " ".join((novelai_prompt_request or "").split())[:500]
     if prompt_request:
@@ -300,8 +362,10 @@ async def reply_with_quick_menu(
     *,
     msg_seq: int = 1,
     novelai_suggestion: str | None = None,
+    gpt_suggestion: str | None = None,
     novelai_prompt_request: str | None = None,
     full_reply_url: str | None = None,
+    mention_user_openid: str | None = None,
     max_chars: int = DEFAULT_MESSAGE_CHARS,
     max_parts: int | None = None,
     split_content: bool = True,
@@ -316,14 +380,18 @@ async def reply_with_quick_menu(
     )
     response = None
     for index, chunk in enumerate(chunks):
+        markdown_content = chunk
+        if index == 0 and mention_user_openid:
+            markdown_content = f"<@{mention_user_openid}> {chunk}"
         reply: dict[str, Any] = {
             "msg_type": 2,
-            "markdown": {"content": chunk},
+            "markdown": {"content": markdown_content},
             "msg_seq": msg_seq + index,
         }
         if index == len(chunks) - 1:
             reply["keyboard"] = quick_menu_keyboard(
                 novelai_suggestion=novelai_suggestion,
+                gpt_suggestion=gpt_suggestion,
                 novelai_prompt_request=novelai_prompt_request,
                 full_reply_url=full_reply_url,
             )

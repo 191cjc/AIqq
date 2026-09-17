@@ -1,0 +1,27 @@
+{
+  "service": {
+    "MainPID": "1393579",
+    "ExecMainStartTimestamp": "Wed 2026-09-16 20:34:04 CST",
+    "UMask": "0077",
+    "ActiveState": "active"
+  },
+  "qq_connected": true,
+  "novelai_ready": true,
+  "storage": {
+    "group_message_events": 457,
+    "message_versions": 1264,
+    "message_attachments": 210,
+    "unprojected_events": 0,
+    "write_failures": 0
+  },
+  "old_messages_preserved_exactly": 1262,
+  "current_message_count": 1264,
+  "environment_unchanged": true,
+  "systemd_unit_unchanged": true,
+  "reviewed_source_hashes_match": true,
+  "full_tests": 272,
+  "final_production_systemd_search_tests": 7,
+  "live_verification": "web-search-live-result.json",
+  "manual_qq_send": false,
+  "historical_replay": false
+}

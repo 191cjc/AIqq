@@ -1,0 +1,20 @@
+{
+  "protocol_version": 2,
+  "operation": "chat",
+  "reference_material": {
+    "available": true,
+    "group_messages": [
+      {
+        "record_id": 501,
+        "role": "user",
+        "sender_name": "成员甲",
+        "sent_at": "2026-09-16T11:43:48+08:00",
+        "content": "这张表情包太有意思了 <faceType=6,faceId=\"0\",ext=\"eyJ0ZXh0IjoiIn0=\">",
+        "message_type": 0,
+        "reply_summary": "",
+        "has_image": true
+      }
+    ]
+  },
+  "user_input": "刚才那张表情包是什么意思？"
+}

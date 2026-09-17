@@ -86,7 +86,7 @@ class GroupMessageRepositoryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([item.role for item in history], ["user", "user", "assistant"])
 
-    async def test_progress_and_recalled_messages_are_not_reference_material(self):
+    async def test_progress_and_recalled_messages_are_reference_material_with_state(self):
         await self.add_event("first", image=True)
         await self.repository.add_bot_message(
             message_id="progress",
@@ -117,7 +117,9 @@ class GroupMessageRepositoryTests(unittest.IsolatedAsyncioTestCase):
             "group-1", before_message_id="", limit=50
         )
 
-        self.assertEqual([item.content for item in history], ["hello"])
+        self.assertEqual([item.content for item in history], ["hello", "searching", "temporary final"])
+        self.assertTrue(history[1].record["derived"]["progress"])
+        self.assertEqual(history[2].record["derived"]["recall_state"], "confirmed")
         self.assertTrue(history[0].has_image)
 
     async def test_reference_image_urls_are_group_scoped_and_include_quotes(self):
@@ -181,7 +183,7 @@ class GroupMessageRepositoryTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_filtering_happens_before_fifty_message_limit(self):
+    async def test_latest_fifty_includes_progress_without_hidden_filtering(self):
         await self.add_event("valid-old", content="must remain")
         for index in range(60):
             await self.repository.add_bot_message(
@@ -197,7 +199,10 @@ class GroupMessageRepositoryTests(unittest.IsolatedAsyncioTestCase):
         history = await self.repository.list_for_reference(
             "group-1", before_message_id="", limit=50
         )
-        self.assertEqual([item.content for item in history], ["must remain"])
+        self.assertEqual(len(history), 50)
+        self.assertEqual(history[0].record["record"]["message_id"], "progress-10")
+        self.assertTrue(all(item.record["derived"]["progress"] for item in history))
+        self.assertTrue(await self.repository.has_before("group-1", history[0].record_id))
 
     async def test_console_context_only_uses_recent_mentions_and_free_sequence(self):
         await self.add_event("plain")

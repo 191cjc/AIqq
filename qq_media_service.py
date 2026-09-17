@@ -40,4 +40,7 @@ async def upload_qq_image(message, public_url: str) -> dict[str, str]:
     file_info: Any = result.get("file_info")
     if not isinstance(file_info, str) or not file_info:
         raise QQMediaError("QQ 图片上传响应缺少 file_info。")
+    record_uploaded_media = getattr(message, "_record_uploaded_media", None)
+    if callable(record_uploaded_media):
+        record_uploaded_media(file_info, public_url)
     return {"file_info": file_info}

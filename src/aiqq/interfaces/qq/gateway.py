@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,7 +15,7 @@ from botpy.gateway import BotWebSocket
 
 
 GROUP_MESSAGE_EVENTS = {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}
-RawGroupMessageCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
+RawGroupMessageCallback = Callable[..., Awaitable[None] | None]
 
 
 @dataclass
@@ -88,6 +89,10 @@ class MonitoredBotWebSocket(BotWebSocket):
         self._on_gateway_connected = on_connected
         self._on_gateway_disconnected = on_disconnected
         self._on_group_message = on_group_message
+        self._capture_connection_id = uuid.uuid4().hex
+        self._raw_callback_parameters = (
+            inspect.signature(on_group_message).parameters if on_group_message else {}
+        )
         if on_group_message is not None:
             self._parser.setdefault("group_message_create", lambda _payload: None)
 
@@ -104,11 +109,22 @@ class MonitoredBotWebSocket(BotWebSocket):
         if event in {"READY", "RESUMED"}:
             self._on_gateway_connected(event == "RESUMED")
         if (
-            event in GROUP_MESSAGE_EVENTS
+            _is_group_event(event, payload)
             and isinstance(payload, dict)
             and self._on_group_message is not None
         ):
-            pending = self._on_group_message(event, payload)
+            # Preserve the original WebSocket text before SDK normalization.
+            # Older callbacks remain supported without polluting the envelope.
+            supports_kwargs = any(
+                item.kind is inspect.Parameter.VAR_KEYWORD
+                for item in self._raw_callback_parameters.values()
+            )
+            metadata = {"raw_text": message, "connection_id": self._capture_connection_id}
+            kwargs = {
+                name: value for name, value in metadata.items()
+                if supports_kwargs or name in self._raw_callback_parameters
+            }
+            pending = self._on_group_message(event, payload, **kwargs)
             if inspect.isawaitable(pending):
                 await pending
         await super().on_message(ws, message)
@@ -124,3 +140,12 @@ class MonitoredBotWebSocket(BotWebSocket):
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _is_group_event(event: str, payload: object) -> bool:
+    if not event or not isinstance(payload, dict):
+        return False
+    data = payload.get("d")
+    return event.startswith("GROUP_") or (
+        isinstance(data, dict) and isinstance(data.get("group_openid"), str)
+    )

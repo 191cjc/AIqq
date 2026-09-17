@@ -1,0 +1,49 @@
+{
+  "date": "2026-09-16",
+  "mode": "diagnosis only; synthetic upstream, actual installed Codex CLI",
+  "normal_shell_reproduced": true,
+  "production_systemd_reproduced": true,
+  "bridge_calls": [
+    {
+      "method": "POST",
+      "path": "/v1/responses",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/v1/alpha/search",
+      "status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses",
+      "status": 200
+    }
+  ],
+  "model_visible_search_result": "aborted",
+  "upstream_search_requests": 0,
+  "bot_failure_records": [
+    {
+      "record_id": 854,
+      "time": "17:53:25"
+    },
+    {
+      "record_id": 1161,
+      "time": "18:34:45"
+    },
+    {
+      "record_id": 1242,
+      "time": "19:31:57"
+    },
+    {
+      "record_id": 1248,
+      "time": "19:44:39"
+    }
+  ],
+  "production_code_changed": false,
+  "service_restarted": false,
+  "source_sha256": {
+    "src/aiqq/services/ai/chat_runtime.py": "8e1e4654c0fcc9cff51ec0a453894828a6f30c6755c1847a6234c4be18edb940",
+    "src/aiqq/services/ai/codex_sdk.py": "6863b5216c0c26bf1436594a3dadfa1c67323ce607fb2638d500208819fbc6bd"
+  }
+}

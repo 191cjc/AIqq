@@ -1,10 +1,13 @@
+import asyncio
 import base64
 import json
 import unittest
 from io import BytesIO
+from unittest.mock import AsyncMock
 
 from PIL import Image
 
+from aiqq.exceptions import ImageGenerationUnavailable
 from aiqq.services.images.novelai import (
     NOVELAI_IMAGE_SIZES,
     NOVELAI_STEPS,
@@ -62,6 +65,78 @@ class FakeMCPClient:
 
 
 class NovelAIServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_absent_configuration_and_uninitialized_client_have_typed_errors(self):
+        for service, kind, configured in (
+            (NovelAIService(None), "not_configured", False),
+            (NovelAIService(FakeMCPClient(image_result())), "not_ready", True),
+        ):
+            with self.subTest(kind=kind):
+                self.assertEqual(service.is_configured, configured)
+                self.assertFalse(service.is_ready)
+                with self.assertRaises(ImageGenerationUnavailable) as raised:
+                    await service.generate("white cat")
+                self.assertIsInstance(raised.exception, NovelAIError)
+                self.assertIsInstance(raised.exception, RuntimeError)
+                self.assertEqual(raised.exception.kind, kind)
+
+        with self.assertLogs("aiqq.services.images.novelai") as logs:
+            await NovelAIService(None).initialize()
+        self.assertIn("error_kind=not_configured", "\n".join(logs.output))
+
+    async def test_missing_generation_tool_is_not_ready(self):
+        for response in (
+            {}, {"tools": []}, {"tools": {}},
+            {"tools": [{"name": "get_account_info"}]},
+        ):
+            with self.subTest(response=response):
+                client = FakeMCPClient(image_result())
+                client.list_tools = AsyncMock(return_value=response)
+                service = NovelAIService(client)
+                with self.assertLogs("aiqq.services.images.novelai"):
+                    self.assertFalse(await service.check_connection())
+                self.assertTrue(service.is_configured)
+                self.assertFalse(service.is_ready)
+                with self.assertRaises(NovelAIError) as raised:
+                    await service.generate("white cat")
+                self.assertEqual(raised.exception.kind, "not_ready")
+                self.assertEqual(client.calls, [])
+
+    async def test_failed_discovery_clears_readiness_without_logging_remote_details(self):
+        client = FakeMCPClient(image_result())
+        service = NovelAIService(client)
+        self.assertTrue(await service.check_connection())
+        private_details = "https://private.example/mcp?token=secret private prompt"
+        client.list_tools = AsyncMock(side_effect=RuntimeError(private_details))
+
+        with self.assertLogs("aiqq.services.images.novelai") as logs:
+            self.assertFalse(await service.check_connection())
+
+        self.assertFalse(service.is_ready)
+        self.assertNotIn(private_details, "\n".join(logs.output))
+        self.assertIn("error_type=RuntimeError", "\n".join(logs.output))
+        with self.assertRaises(NovelAIError) as raised:
+            await service.generate("white cat")
+        self.assertEqual(raised.exception.kind, "not_ready")
+
+    async def test_discovery_cancellation_propagates_and_clears_readiness(self):
+        client = FakeMCPClient(image_result())
+        service = NovelAIService(client)
+        await service.initialize()
+        client.list_tools = AsyncMock(side_effect=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await service.check_connection()
+        self.assertFalse(service.is_ready)
+
+    async def test_generation_without_optional_steps_is_ready(self):
+        client = FakeMCPClient(image_result(), supports_steps=False)
+        service = NovelAIService(client)
+        with self.assertLogs("aiqq.services.images.novelai"):
+            await service.initialize()
+
+        self.assertTrue(service.is_ready)
+        await service.generate("white cat")
+        self.assertNotIn("steps", client.calls[0][1])
+
     async def test_generation_uses_capability_and_returns_validated_asset(self):
         client = FakeMCPClient(image_result())
         service = NovelAIService(client)
@@ -95,8 +170,11 @@ class NovelAIServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_close_closes_injected_transport(self):
         client = FakeMCPClient(image_result())
-        await NovelAIService(client).close()
+        service = NovelAIService(client)
+        await service.initialize()
+        await service.close()
         self.assertTrue(client.closed)
+        self.assertFalse(service.is_ready)
 
     def test_sse_response_is_decoded(self):
         payload = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}

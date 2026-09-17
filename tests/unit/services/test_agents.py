@@ -83,7 +83,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(backend.calls[0]["output_schema"], CHAT_AGENT_OUTPUT_SCHEMA)
         self.assertTrue(backend.calls[0]["enable_gpt_image_skill"])
         payload = json.loads(backend.calls[0]["model_input"])
-        self.assertEqual(payload["protocol_version"], 2)
+        self.assertEqual(payload["protocol_version"], 3)
         self.assertEqual(payload["operation"], "chat")
         self.assertEqual(
             payload["reference_material"]["group_messages"][0]["role"],

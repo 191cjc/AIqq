@@ -1,0 +1,15 @@
+{
+  "original_records_verified": 808,
+  "original_columns_unchanged": true,
+  "legacy_snapshots": 808,
+  "release_files_verified": 76,
+  "environment_unchanged": true,
+  "restart_at": "2026-09-16T16:09:51+08:00",
+  "pid": 1297532,
+  "health_local": "ok",
+  "health_public": "ok",
+  "qq_connected": true,
+  "novelai_ready": true,
+  "unit_tests_passed": 264,
+  "live_vision_success": true
+}

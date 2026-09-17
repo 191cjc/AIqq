@@ -1,8 +1,9 @@
 """Framework-independent business objects shared across application layers."""
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 
 PromptAuditCategory = Literal[
@@ -73,6 +74,7 @@ class GroupHistoryMessage:
     message_type: int | None = None
     reply_summary: str = ""
     has_image: bool = False
+    record: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.record_id < 1:
@@ -87,6 +89,9 @@ class ConversationRequest:
     group_history: tuple[GroupHistoryMessage, ...]
     reference_material_available: bool
     conversation_key: str
+    group_id: str = ""
+    current_message: GroupHistoryMessage | None = None
+    history_has_more: bool | None = None
 
     def __post_init__(self) -> None:
         if not self.user_input.strip():
@@ -201,6 +206,7 @@ class ConversationResult:
     images: tuple[ImageAsset, ...] = ()
     sources: tuple[SourceReference, ...] = ()
     error_code: str | None = None
+    image_provenance: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.full_text.strip():

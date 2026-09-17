@@ -1,5 +1,9 @@
+import asyncio
 import unittest
+from unittest.mock import AsyncMock
 
+from aiqq.exceptions import ImageGenerationUnavailable
+from aiqq.logic.image_quota import ImageQuotaManager
 from aiqq.logic.models import (
     ImageAsset,
     ImagePromptAuditResult,
@@ -97,6 +101,70 @@ class FakeSessions:
 
 
 class NovelAIWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_configuration_failures_have_safe_fixed_copy_and_release_quota(self):
+        for kind, text, code in (
+            (
+                "not_configured", "NovelAI 生图服务未配置，请联系管理员。",
+                "novelai_service_not_configured",
+            ),
+            (
+                "not_ready", "NovelAI 生图服务连接未就绪，请稍后再试。",
+                "novelai_service_not_ready",
+            ),
+            (
+                "private-unknown-kind", "NovelAI 图片生成暂时不可用，请稍后再试。",
+                "novelai_generation_unavailable",
+            ),
+        ):
+            with self.subTest(kind=kind):
+                usage = FakeUsage()
+                workflow = NovelAIImageWorkflow(
+                    prompt_auditor=FakeAuditor(audit()),
+                    image_service=FakeNovelAI(
+                        ImageGenerationUnavailable("secret upstream details", kind=kind)
+                    ),
+                    image_usage=usage,
+                )
+                with self.assertLogs("aiqq.logic.novelai") as logs:
+                    result = await workflow.run("white cat", conversation_key="key")
+                self.assertEqual(result.status, "unavailable")
+                self.assertEqual(result.full_text, text)
+                self.assertEqual(result.summary, text)
+                self.assertEqual(result.error_code, code)
+                self.assertEqual(result.images, ())
+                self.assertEqual(usage.recorded, [])
+                self.assertEqual(usage.finished, ["key"])
+                self.assertNotIn("secret", "\n".join(logs.output) + result.full_text)
+                self.assertNotIn("private-unknown-kind", "\n".join(logs.output))
+
+    async def test_failure_and_cancellation_release_real_quota_for_next_request(self):
+        for error in (
+            ImageGenerationUnavailable("missing config", kind="not_configured"),
+            ImageGenerationUnavailable("not initialized", kind="not_ready"),
+            asyncio.CancelledError(),
+        ):
+            with self.subTest(error=type(error).__name__):
+                repository = AsyncMock()
+                repository.success_count.return_value = 0
+                quota = ImageQuotaManager(repository, daily_limit=100)
+                images = FakeNovelAI(error)
+                workflow = NovelAIImageWorkflow(
+                    prompt_auditor=FakeAuditor(audit()),
+                    image_service=images,
+                    image_usage=quota,
+                )
+                if isinstance(error, asyncio.CancelledError):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await workflow.run("white cat", conversation_key="key")
+                else:
+                    result = await workflow.run("white cat", conversation_key="key")
+                    self.assertEqual(result.status, "unavailable")
+                repository.increment_success.assert_not_awaited()
+                images.error = None
+                result = await workflow.run("white cat", conversation_key="next-member")
+                self.assertEqual(result.status, "ok")
+                repository.increment_success.assert_awaited_once()
+
     async def test_image_generation_requires_english_and_counts_success(self):
         auditor = FakeAuditor(audit(orientation="portrait"))
         usage = FakeUsage()

@@ -17,6 +17,10 @@ class AgentUnavailable(AgentError):
     """Raised when an AI backend cannot complete a request."""
 
 
+class AgentContextTooLarge(AgentUnavailable):
+    """The complete supplied history exceeds the model's actual context limit."""
+
+
 class InvalidAgentOutput(AgentError):
     """Raised when model output violates its structured contract."""
 
@@ -55,6 +59,28 @@ class ImageGenerationUnavailable(AiQQError):
         self.attempt_id = attempt_id
         self.status_code = status_code
         self.provider_request_id = provider_request_id
+
+
+class ReferenceImageUnavailable(AiQQError):
+    """No reference image could be loaded; contains only safe failure metadata."""
+
+    def __init__(
+        self,
+        message: str = "referenced image is unavailable",
+        *,
+        kind: str = "download_failed",
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind if kind in {
+            "expired", "missing", "timeout", "access_denied",
+            "invalid_image", "too_large", "download_failed",
+        } else "download_failed"
+        self.status_code = (
+            status_code
+            if type(status_code) is int and 100 <= status_code <= 599
+            else None
+        )
 
 
 class NovelAIPromptUnavailable(AgentUnavailable):

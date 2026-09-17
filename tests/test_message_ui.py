@@ -86,10 +86,10 @@ class MessageUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(button["action"]["permission"]["type"], 2)
         self.assertEqual(button["action"]["data"], full_reply_url)
 
-    def test_feature_menu_restores_clear_prompt_and_image_buttons(self):
+    def test_feature_menu_restores_all_command_buttons(self):
         rows = feature_menu_keyboard()["content"]["rows"]
 
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(rows), 4)
         self.assertEqual(rows[0]["buttons"][0]["render_data"]["label"], "清除记忆")
         prompt_button = rows[1]["buttons"][0]
         self.assertEqual(prompt_button["render_data"]["label"], "NovelAI提示词")
@@ -101,14 +101,18 @@ class MessageUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(image_button["action"]["permission"]["type"], 2)
         self.assertEqual(image_button["action"]["data"], "NovelAI生图")
         self.assertFalse(image_button["action"]["enter"])
+        gpt_image_button = rows[3]["buttons"][0]
+        self.assertEqual(gpt_image_button["render_data"]["label"], "GPT生图")
+        self.assertEqual(gpt_image_button["action"]["data"], "GPT生图")
+        self.assertFalse(gpt_image_button["action"]["enter"])
 
     def test_suggestion_button_fills_complete_image_command(self):
         rows = feature_menu_keyboard(
             novelai_suggestion="white cat, morning sunlight"
         )["content"]["rows"]
 
-        self.assertEqual(len(rows), 4)
-        button = rows[3]["buttons"][0]
+        self.assertEqual(len(rows), 5)
+        button = rows[4]["buttons"][0]
         self.assertEqual(button["render_data"]["label"], "🟢 使用建议")
         self.assertEqual(button["render_data"]["style"], 0)
         self.assertNotEqual(
@@ -180,22 +184,38 @@ class MessageUITests(unittest.IsolatedAsyncioTestCase):
             "rows"
         ]
 
-        self.assertEqual(len(rows), 4)
-        self.assertEqual(rows[3]["buttons"][0]["action"]["data"], full_reply_url)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(rows[4]["buttons"][0]["action"]["data"], full_reply_url)
 
-    def test_quick_menu_carries_suggestion_to_menu_command(self):
+    def test_quick_menu_adds_direct_novelai_suggestion_button(self):
         rows = quick_menu_keyboard(
             novelai_suggestion="white cat, morning sunlight"
         )["content"]["rows"]
 
-        self.assertEqual(len(rows), 1)
-        button = rows[0]["buttons"][0]
-        self.assertEqual(button["render_data"]["label"], "功能菜单")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["buttons"][0]["action"]["data"], "/菜单")
+        button = rows[1]["buttons"][0]
+        self.assertEqual(button["render_data"]["label"], "🟢 使用建议")
+        self.assertEqual(button["render_data"]["style"], 0)
         self.assertEqual(
             button["action"]["data"],
-            "/菜单 white cat, morning sunlight",
+            "NovelAI生图 white cat, morning sunlight",
         )
-        self.assertTrue(button["action"]["enter"])
+        self.assertFalse(button["action"]["enter"])
+
+    def test_quick_menu_adds_direct_gpt_suggestion_button(self):
+        rows = quick_menu_keyboard(
+            gpt_suggestion="white cat, morning sunlight"
+        )["content"]["rows"]
+
+        self.assertEqual(len(rows), 2)
+        button = rows[1]["buttons"][0]
+        self.assertEqual(button["render_data"]["label"], "🟢 使用建议")
+        self.assertEqual(
+            button["action"]["data"],
+            "GPT生图 white cat, morning sunlight",
+        )
+        self.assertFalse(button["action"]["enter"])
 
     def test_quick_menu_carries_original_prompt_to_prompt_command(self):
         rows = quick_menu_keyboard(
@@ -214,8 +234,8 @@ class MessageUITests(unittest.IsolatedAsyncioTestCase):
             novelai_prompt_request="一只坐在窗边的白猫"
         )["content"]["rows"]
 
-        self.assertEqual(len(rows), 4)
-        button = rows[3]["buttons"][0]
+        self.assertEqual(len(rows), 5)
+        button = rows[4]["buttons"][0]
         self.assertEqual(button["render_data"]["label"], "🟢 生成提示词方案")
         self.assertEqual(button["render_data"]["style"], 0)
         self.assertEqual(
@@ -253,6 +273,22 @@ class MessageUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply["markdown"]["content"], "主人，简要结论，喵。")
         rows = reply["keyboard"]["content"]["rows"]
         self.assertEqual(rows[1]["buttons"][0]["action"]["data"], full_reply_url)
+
+    async def test_reply_can_mention_group_user_without_message_reference(self):
+        message = FakeMessage()
+
+        await reply_with_quick_menu(
+            message,
+            "主人，回复内容，喵。",
+            mention_user_openid="member-openid-1",
+        )
+
+        reply = message.reply_calls[0]
+        self.assertEqual(
+            reply["markdown"]["content"],
+            "<@member-openid-1> 主人，回复内容，喵。",
+        )
+        self.assertNotIn("message_reference", reply)
 
     async def test_long_reply_adds_quick_menu_only_to_final_message(self):
         message = FakeMessage()
@@ -315,9 +351,9 @@ class MessageUITests(unittest.IsolatedAsyncioTestCase):
         )
 
         rows = message.reply_calls[0]["keyboard"]["content"]["rows"]
-        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(rows), 5)
         self.assertEqual(
-            rows[3]["buttons"][0]["action"]["data"],
+            rows[4]["buttons"][0]["action"]["data"],
             "NovelAI生图 mountain lake, sunrise",
         )
 

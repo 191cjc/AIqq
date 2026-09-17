@@ -2,12 +2,12 @@ import unittest
 from types import SimpleNamespace
 
 from ai_service import (
-    ImagePromptQualityResult,
+    ImagePromptAuditResult,
     NovelAIPromptOptionsResult,
-    PromptSafetyResult,
     normalize_reply_summary,
 )
 from bot import AiQQBot
+from gpt_image_service import GPTGeneratedImage, GPTImageError
 from image_generation import UsageDecision
 from media_store import MediaAsset
 from novelai_service import GeneratedImage, NovelAIError
@@ -50,11 +50,9 @@ class FakeAPI:
 
 
 class FakeAI:
-    def __init__(self, moderation, review):
-        self.moderation = moderation
-        self.review = review
-        self.prompts = []
-        self.review_prompts = []
+    def __init__(self, audit):
+        self.audit = audit
+        self.audit_calls = []
         self.total_timeout_seconds = 270
         self.max_reply_chars = 3000
         self.created_prompt_calls = []
@@ -68,30 +66,20 @@ class FakeAI:
         )
         self.summary_calls = []
 
-    async def summarize_reply(self, content):
-        self.summary_calls.append(content)
+    async def summarize_reply(self, content, user_prompt=""):
+        self.summary_calls.append((content, user_prompt))
         return normalize_reply_summary(content)
 
-    async def moderate_image_prompt(self, prompt):
-        self.prompts.append(prompt)
-        return self.moderation
+    async def audit_image_prompt(self, prompt, *, require_english=False):
+        self.audit_calls.append((prompt, require_english))
+        return self.audit
 
-    async def review_image_prompt(self, prompt):
-        self.review_prompts.append(prompt)
-        return self.review
-
-    async def create_novelai_prompts(
-        self, description, *, history=(), summary=""
-    ):
-        self.created_prompt_calls.append((description, list(history), summary))
+    async def create_novelai_prompts(self, description):
+        self.created_prompt_calls.append(description)
         return self.created_prompt_result
 
-    async def revise_novelai_prompts(
-        self, prompts, request, *, history=(), summary=""
-    ):
-        self.revised_prompt_calls.append(
-            (tuple(prompts), request, list(history), summary)
-        )
+    async def revise_novelai_prompts(self, prompts, request):
+        self.revised_prompt_calls.append((tuple(prompts), request))
         return self.revised_prompt_result
 
 
@@ -101,13 +89,30 @@ class FakeNovelAI:
 
     def __init__(self):
         self.prompts = []
+        self.orientations = []
+        self.error = None
+
+    async def generate(self, prompt, *, orientation="square"):
+        self.prompts.append(prompt)
+        self.orientations.append(orientation)
+        if self.error is not None:
+            raise self.error
+        return GeneratedImage(b"image", "image/png")
+
+
+class FakeGPTImage:
+    is_configured = True
+    model = "gpt-image-2"
+
+    def __init__(self):
+        self.prompts = []
         self.error = None
 
     async def generate(self, prompt):
         self.prompts.append(prompt)
         if self.error is not None:
             raise self.error
-        return GeneratedImage(b"image", "image/png")
+        return GPTGeneratedImage(b"gpt-image", "image/png")
 
 
 class FakeUsage:
@@ -141,28 +146,6 @@ class FakeReplyStore:
         )
 
 
-class FakeContext:
-    summary = "用户喜欢柔和光线。"
-
-    def model_history(self):
-        return [{"role": "user", "content": "使用日系插画风格"}]
-
-
-class FakeConversations:
-    def __init__(self):
-        self.recorded = []
-        self.summarized = []
-
-    async def load_context(self, key):
-        return FakeContext()
-
-    async def record_round(self, key, user_content, assistant_content):
-        self.recorded.append((key, user_content, assistant_content))
-
-    async def summarize_if_needed(self, key):
-        self.summarized.append(key)
-
-
 class FakePromptSessions:
     def __init__(self):
         self.created = []
@@ -177,26 +160,49 @@ class FakePromptSessions:
         return self.loaded
 
 
-def make_bot(moderation, review=None):
-    if review is None:
-        review = ImagePromptQualityResult(True, True, False, "", "valid")
+def make_audit(
+    *,
+    safe=True,
+    effective=True,
+    available=True,
+    contains_chinese=False,
+    category="safe",
+    reason="valid",
+    suggested_prompt="",
+    orientation="square",
+):
+    return ImagePromptAuditResult(
+        safe,
+        effective,
+        available,
+        contains_chinese,
+        category,
+        reason,
+        suggested_prompt,
+        orientation,
+    )
+
+
+def make_bot(audit=None):
+    audit = audit or make_audit()
     bot = SimpleNamespace(
-        ai=FakeAI(moderation, review),
+        ai=FakeAI(audit),
+        gpt_image=FakeGPTImage(),
         novelai=FakeNovelAI(),
         image_usage=FakeUsage(),
         media_store=FakeMediaStore(),
         reply_store=FakeReplyStore(),
-        conversations=FakeConversations(),
         prompt_sessions=FakePromptSessions(),
     )
     bot.prepare_novelai_prompt = AiQQBot.prepare_novelai_prompt.__get__(bot)
     bot.revise_novelai_prompt = AiQQBot.revise_novelai_prompt.__get__(bot)
+    bot.generate_gpt_image = AiQQBot.generate_gpt_image.__get__(bot)
     return bot
 
 
 class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
-    async def test_prompt_command_returns_three_options_and_records_history(self):
-        bot = make_bot(PromptSafetyResult(True, True, "safe"))
+    async def test_prompt_command_returns_three_options_through_ai_session(self):
+        bot = make_bot()
         message = FakeMessage(
             "/NovelAI提示词 一位站在樱花树下的白发少女"
         )
@@ -205,25 +211,22 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
             bot, message, "group:1:member:1"
         )
 
-        self.assertEqual(len(bot.ai.created_prompt_calls), 1)
-        description, history, summary = bot.ai.created_prompt_calls[0]
-        self.assertEqual(description, "一位站在樱花树下的白发少女")
-        self.assertEqual(history[0]["content"], "使用日系插画风格")
-        self.assertEqual(summary, "用户喜欢柔和光线。")
+        self.assertEqual(
+            bot.ai.created_prompt_calls,
+            ["一位站在樱花树下的白发少女"],
+        )
         self.assertEqual(bot.novelai.prompts, [])
         self.assertEqual(bot.image_usage.success_keys, [])
-        self.assertEqual(len(bot.conversations.recorded), 1)
-        recorded = bot.conversations.recorded[0]
-        self.assertIn("NovelAI提示词 一位站在樱花树下", recorded[1])
-        self.assertIn("方案1", recorded[2])
-        self.assertIn(PROMPT_OPTIONS[0], recorded[2])
-        self.assertEqual(bot.conversations.summarized, ["group:1:member:1"])
 
         reply = message.reply_calls[0]
-        self.assertLessEqual(len(reply["markdown"]["content"]), 30)
+        self.assertLessEqual(len(reply["markdown"]["content"]), 50)
         self.assertNotIn("```text", reply["markdown"]["content"])
         self.assertIn("方案1", bot.reply_store.saved[-1])
         self.assertIn(PROMPT_OPTIONS[0], bot.reply_store.saved[-1])
+        self.assertEqual(
+            bot.ai.summary_calls[0][1],
+            "一位站在樱花树下的白发少女",
+        )
         rows = reply["keyboard"]["content"]["rows"]
         self.assertEqual(len(rows), 5)
         self.assertTrue(all(len(row["buttons"]) == 1 for row in rows))
@@ -239,7 +242,7 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[4]["buttons"][0]["render_data"]["label"], "查看完整输出")
 
     async def test_prompt_edit_uses_session_and_records_revised_options(self):
-        bot = make_bot(PromptSafetyResult(True, True, "safe"))
+        bot = make_bot()
         bot.prompt_sessions.loaded = PromptSession(
             "old-session-token", PROMPT_OPTIONS
         )
@@ -255,15 +258,13 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         call = bot.ai.revised_prompt_calls[0]
         self.assertEqual(call[0], PROMPT_OPTIONS)
         self.assertEqual(call[1], "方案2改成夜景")
-        self.assertEqual(len(bot.conversations.recorded), 1)
-        self.assertIn("修改NovelAI提示词 方案2改成夜景", bot.conversations.recorded[0][1])
-        self.assertIn("night city", bot.conversations.recorded[0][2])
+        self.assertEqual(bot.ai.summary_calls[0][1], "方案2改成夜景")
         rows = message.reply_calls[0]["keyboard"]["content"]["rows"]
         self.assertIn("night city", rows[0]["buttons"][0]["action"]["data"])
         self.assertIn("new-session-token", rows[3]["buttons"][0]["action"]["data"])
 
     async def test_prompt_edit_rejects_expired_or_foreign_session(self):
-        bot = make_bot(PromptSafetyResult(True, True, "safe"))
+        bot = make_bot()
         message = FakeMessage(
             "修改NovelAI提示词 invalid-token 改成夜景"
         )
@@ -273,17 +274,16 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(bot.ai.revised_prompt_calls, [])
-        self.assertEqual(bot.conversations.recorded, [])
-        self.assertIn("不存在或已超过 15 分钟", message.reply_calls[0]["markdown"]["content"])
+        self.assertIn("这次修改已经过期", message.reply_calls[0]["markdown"]["content"])
+        self.assertIn("喵", message.reply_calls[0]["markdown"]["content"])
 
     async def test_unsafe_prompt_request_is_not_generated_or_recorded(self):
         bot = make_bot(
-            PromptSafetyResult(
-                False,
-                True,
-                "adult_content",
-                "包含成人内容。",
-                "adult woman, fully clothed, safe, sfw",
+            make_audit(
+                safe=False,
+                category="adult_content",
+                reason="包含成人内容。",
+                suggested_prompt="adult woman, fully clothed, safe, sfw",
             )
         )
         message = FakeMessage("NovelAI提示词 不安全的成人画面")
@@ -293,11 +293,10 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(bot.ai.created_prompt_calls, [])
-        self.assertEqual(bot.conversations.recorded, [])
-        self.assertIn("拦截原因：包含成人内容", message.reply_calls[0]["markdown"]["content"])
+        self.assertIn("原因：包含成人内容", message.reply_calls[0]["markdown"]["content"])
 
     async def test_empty_prompt_returns_reason_without_retry_payload(self):
-        bot = make_bot(PromptSafetyResult(True, True, "safe"))
+        bot = make_bot()
         message = FakeMessage()
 
         await AiQQBot.generate_novelai_image(
@@ -305,21 +304,25 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         reply = message.reply_calls[0]
-        self.assertIn("拦截原因：没有", reply["markdown"]["content"])
+        self.assertIn("原因：没有", reply["markdown"]["content"])
         rows = reply["keyboard"]["content"]["rows"]
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         button = rows[0]["buttons"][0]
         self.assertEqual(button["render_data"]["label"], "功能菜单")
         self.assertEqual(button["action"]["data"], "/菜单")
+        suggestion = rows[1]["buttons"][0]
+        self.assertEqual(suggestion["render_data"]["label"], "🟢 使用建议")
+        self.assertIn("NovelAI生图 peaceful mountain lake", suggestion["action"]["data"])
 
     async def test_unsafe_prompt_never_calls_novelai(self):
         bot = make_bot(
-            PromptSafetyResult(
-                False,
-                True,
-                "adult_content",
-                "提示词包含成人内容。",
-                "adult woman, fully clothed, city street, safe, sfw",
+            make_audit(
+                safe=False,
+                category="adult_content",
+                reason="提示词包含成人内容。",
+                suggested_prompt=(
+                    "adult woman, fully clothed, city street, safe, sfw"
+                ),
             )
         )
         message = FakeMessage()
@@ -329,22 +332,22 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(bot.novelai.prompts, [])
-        self.assertEqual(bot.ai.review_prompts, [])
+        self.assertEqual(bot.ai.audit_calls, [("unsafe prompt", True)])
         self.assertEqual(len(message.reply_calls), 1)
         reply = message.reply_calls[0]
-        self.assertIn("拦截原因：提示词包含成人内容", reply["markdown"]["content"])
+        self.assertIn("原因：提示词包含成人内容", reply["markdown"]["content"])
         self.assertIn("fully clothed", bot.reply_store.saved[-1])
         rows = reply["keyboard"]["content"]["rows"]
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         menu_button = rows[0]["buttons"][0]
         self.assertEqual(menu_button["render_data"]["label"], "功能菜单")
-        self.assertEqual(
-            menu_button["action"]["data"],
-            "/菜单 NovelAI提示词 unsafe prompt",
-        )
+        self.assertEqual(menu_button["action"]["data"], "/菜单")
+        suggestion = rows[1]["buttons"][0]
+        self.assertEqual(suggestion["render_data"]["label"], "🟢 使用建议")
+        self.assertIn("NovelAI生图 adult woman, fully clothed", suggestion["action"]["data"])
 
     async def test_safe_prompt_generates_and_returns_image(self):
-        bot = make_bot(PromptSafetyResult(True, True, "safe"))
+        bot = make_bot()
         message = FakeMessage()
 
         await AiQQBot.generate_novelai_image(
@@ -352,6 +355,8 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(bot.novelai.prompts, ["safe landscape"])
+        self.assertEqual(bot.novelai.orientations, ["square"])
+        self.assertEqual(bot.ai.audit_calls, [("safe landscape", True)])
         self.assertEqual(bot.image_usage.success_keys, ["group:1:member:1"])
         self.assertEqual(bot.image_usage.finished_keys, ["group:1:member:1"])
         self.assertEqual(len(message.reply_calls), 2)
@@ -373,15 +378,33 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_chinese_prompt_returns_english_suggestion_without_generation(self):
-        review = ImagePromptQualityResult(
-            True,
-            True,
-            True,
-            "white cat, sitting by a window",
-            "包含中文",
+    async def test_full_body_audit_uses_portrait_novelai_image(self):
+        bot = make_bot(make_audit(orientation="portrait"))
+        message = FakeMessage()
+
+        await AiQQBot.generate_novelai_image(
+            bot, message, "group:1:member:1", "1girl, full body"
         )
-        bot = make_bot(PromptSafetyResult(True, True, "safe"), review)
+
+        self.assertEqual(bot.novelai.orientations, ["portrait"])
+
+    async def test_lying_pose_audit_uses_landscape_novelai_image(self):
+        bot = make_bot(make_audit(orientation="landscape"))
+        message = FakeMessage()
+
+        await AiQQBot.generate_novelai_image(
+            bot, message, "group:1:member:1", "1girl, lying down"
+        )
+
+        self.assertEqual(bot.novelai.orientations, ["landscape"])
+
+    async def test_chinese_prompt_returns_english_suggestion_without_generation(self):
+        audit = make_audit(
+            contains_chinese=True,
+            reason="包含中文",
+            suggested_prompt="white cat, sitting by a window",
+        )
+        bot = make_bot(audit)
         message = FakeMessage()
 
         await AiQQBot.generate_novelai_image(
@@ -391,27 +414,27 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.novelai.prompts, [])
         self.assertEqual(bot.image_usage.success_keys, [])
         reply = message.reply_calls[0]["markdown"]["content"]
-        self.assertIn("拦截原因：包含中文", reply)
+        self.assertIn("原因：包含中文", reply)
         self.assertIn("white cat", bot.reply_store.saved[-1])
         rows = message.reply_calls[0]["keyboard"]["content"]["rows"]
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["buttons"][0]["render_data"]["label"], "功能菜单")
         self.assertEqual(rows[0]["buttons"][0]["render_data"]["style"], 0)
+        suggestion = rows[1]["buttons"][0]
+        self.assertEqual(suggestion["render_data"]["label"], "🟢 使用建议")
         self.assertEqual(
-            rows[0]["buttons"][0]["action"]["data"],
-            "/菜单 NovelAI提示词 一只坐在窗边的白猫",
+            suggestion["action"]["data"],
+            "NovelAI生图 white cat, sitting by a window",
         )
-        self.assertTrue(rows[0]["buttons"][0]["action"]["enter"])
+        self.assertFalse(suggestion["action"]["enter"])
 
     async def test_ineffective_prompt_never_calls_novelai(self):
-        review = ImagePromptQualityResult(
-            False,
-            True,
-            False,
-            "mountain lake, sunrise",
-            "没有画面内容",
+        audit = make_audit(
+            effective=False,
+            reason="没有画面内容",
+            suggested_prompt="mountain lake, sunrise",
         )
-        bot = make_bot(PromptSafetyResult(True, True, "safe"), review)
+        bot = make_bot(audit)
         message = FakeMessage()
 
         await AiQQBot.generate_novelai_image(
@@ -421,23 +444,24 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.novelai.prompts, [])
         response = message.reply_calls[0]
         reply = response["markdown"]["content"]
-        self.assertIn("拦截原因：没有画面内容", reply)
+        self.assertIn("原因：没有画面内容", reply)
         self.assertIn("mountain lake", bot.reply_store.saved[-1])
         rows = response["keyboard"]["content"]["rows"]
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         self.assertEqual(
-            rows[0]["buttons"][0]["action"]["data"],
-            "/菜单 NovelAI提示词 do it",
+            rows[1]["buttons"][0]["action"]["data"],
+            "NovelAI生图 mountain lake, sunrise",
         )
 
     async def test_unavailable_safety_check_returns_reason_and_suggestion_button(self):
         bot = make_bot(
-            PromptSafetyResult(
-                False,
-                False,
-                "service_unavailable",
-                "安全审核服务暂时不可用。",
-                "peaceful mountain lake, sunrise, safe, sfw",
+            make_audit(
+                safe=False,
+                effective=False,
+                available=False,
+                category="service_unavailable",
+                reason="安全审核服务暂时不可用。",
+                suggested_prompt="peaceful mountain lake, sunrise, safe, sfw",
             )
         )
         message = FakeMessage()
@@ -447,23 +471,24 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         response = message.reply_calls[0]
-        self.assertIn("拦截原因：安全审核服务暂时不可用", response["markdown"]["content"])
-        button = response["keyboard"]["content"]["rows"][0]["buttons"][0]
-        self.assertEqual(button["render_data"]["label"], "功能菜单")
+        self.assertIn("原因：安全审核服务暂时不可用", response["markdown"]["content"])
+        button = response["keyboard"]["content"]["rows"][1]["buttons"][0]
+        self.assertEqual(button["render_data"]["label"], "🟢 使用建议")
         self.assertEqual(
             button["action"]["data"],
-            "/菜单 NovelAI提示词 landscape",
+            "NovelAI生图 peaceful mountain lake, sunrise, safe, sfw",
         )
 
-    async def test_unavailable_quality_check_returns_reason_and_suggestion_button(self):
-        review = ImagePromptQualityResult(
-            False,
-            False,
-            False,
-            "peaceful mountain lake, sunrise, safe, sfw",
-            "提示词有效性检查暂时不可用。",
+    async def test_unavailable_unified_audit_returns_reason_and_suggestion_button(self):
+        audit = make_audit(
+            safe=False,
+            effective=False,
+            available=False,
+            category="service_unavailable",
+            reason="图片提示词审核暂时不可用。",
+            suggested_prompt="peaceful mountain lake, sunrise, safe, sfw",
         )
-        bot = make_bot(PromptSafetyResult(True, True, "safe"), review)
+        bot = make_bot(audit)
         message = FakeMessage()
 
         await AiQQBot.generate_novelai_image(
@@ -471,16 +496,16 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         response = message.reply_calls[0]
-        self.assertIn("拦截原因：提示词有效性检查暂时不可用", response["markdown"]["content"])
-        button = response["keyboard"]["content"]["rows"][0]["buttons"][0]
-        self.assertEqual(button["render_data"]["label"], "功能菜单")
+        self.assertIn("原因：图片提示词审核暂时不可用", response["markdown"]["content"])
+        button = response["keyboard"]["content"]["rows"][1]["buttons"][0]
+        self.assertEqual(button["render_data"]["label"], "🟢 使用建议")
         self.assertEqual(
             button["action"]["data"],
-            "/菜单 NovelAI提示词 landscape",
+            "NovelAI生图 peaceful mountain lake, sunrise, safe, sfw",
         )
 
     async def test_safe_prompt_sends_c2c_image_as_qq_media(self):
-        bot = make_bot(PromptSafetyResult(True, True, "safe"))
+        bot = make_bot()
         message = FakeMessage(c2c=True)
 
         await AiQQBot.generate_novelai_image(
@@ -507,7 +532,7 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_failed_generation_releases_global_slot(self):
-        bot = make_bot(PromptSafetyResult(True, True, "safe"))
+        bot = make_bot()
         bot.novelai.error = NovelAIError("timeout")
         message = FakeMessage()
 
@@ -518,8 +543,67 @@ class BotImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.image_usage.success_keys, [])
         self.assertEqual(bot.image_usage.finished_keys, ["group:1:member:1"])
         self.assertIn(
-            "生图失败", message.reply_calls[1]["markdown"]["content"]
+            "画笔卡住", message.reply_calls[1]["markdown"]["content"]
         )
+
+    async def test_gpt_image_command_accepts_chinese_and_returns_qq_image(self):
+        bot = make_bot()
+        message = FakeMessage("/GPT生图 雨夜霓虹街道上的白猫")
+
+        await AiQQBot.reply_with_context(
+            bot, message, "group:1:member:1"
+        )
+
+        self.assertEqual(bot.ai.audit_calls, [("雨夜霓虹街道上的白猫", False)])
+        self.assertEqual(bot.gpt_image.prompts, ["雨夜霓虹街道上的白猫"])
+        self.assertEqual(bot.novelai.prompts, [])
+        self.assertEqual(bot.image_usage.success_keys, ["group:1:member:1"])
+        self.assertEqual(bot.image_usage.finished_keys, ["group:1:member:1"])
+        self.assertEqual(len(message.reply_calls), 2)
+        self.assertIn("GPT 正在画图", message.reply_calls[0]["markdown"]["content"])
+        self.assertEqual(message.reply_calls[1]["msg_type"], 7)
+        self.assertEqual(
+            message.reply_calls[1]["media"], {"file_info": "qq-file-info"}
+        )
+
+    async def test_unsafe_gpt_prompt_is_rejected_before_generation(self):
+        bot = make_bot(
+            make_audit(
+                safe=False,
+                category="adult_content",
+                reason="提示词包含成人内容。",
+                suggested_prompt="fully clothed adult, city street, safe, sfw",
+            )
+        )
+        message = FakeMessage("GPT生图 unsafe request")
+
+        await AiQQBot.reply_with_context(
+            bot, message, "group:1:member:1"
+        )
+
+        self.assertEqual(bot.gpt_image.prompts, [])
+        self.assertEqual(bot.image_usage.success_keys, [])
+        self.assertIn("原因：提示词包含成人内容", bot.reply_store.saved[-1])
+        rows = message.reply_calls[0]["keyboard"]["content"]["rows"]
+        suggestion = rows[1]["buttons"][0]
+        self.assertEqual(suggestion["render_data"]["label"], "🟢 使用建议")
+        self.assertEqual(
+            suggestion["action"]["data"],
+            "GPT生图 fully clothed adult, city street, safe, sfw",
+        )
+
+    async def test_failed_gpt_generation_releases_global_slot(self):
+        bot = make_bot()
+        bot.gpt_image.error = GPTImageError("timeout")
+        message = FakeMessage()
+
+        await AiQQBot.generate_gpt_image(
+            bot, message, "group:1:member:1", "safe landscape"
+        )
+
+        self.assertEqual(bot.image_usage.success_keys, [])
+        self.assertEqual(bot.image_usage.finished_keys, ["group:1:member:1"])
+        self.assertIn("GPT 的画笔卡住", message.reply_calls[1]["markdown"]["content"])
 
 
 if __name__ == "__main__":

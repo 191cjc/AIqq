@@ -1,0 +1,59 @@
+{
+  "model": "gpt-6-astra",
+  "success": true,
+  "answer": {
+    "failure_reason": "",
+    "image_url": "https://wallpaper.dog/large/20503843.jpg",
+    "success": true,
+    "web_title": "Codex CLI | ChatGPT Learn",
+    "web_url": "https://learn.chatgpt.com/docs/codex/cli"
+  },
+  "work_turns_remaining": 0,
+  "runtime_turns_remaining": 0,
+  "search_calls": [
+    {
+      "path": "/alpha/search",
+      "method": "POST",
+      "request_keys": [
+        "commands",
+        "id",
+        "input",
+        "max_output_tokens",
+        "model",
+        "settings"
+      ],
+      "status": 200
+    },
+    {
+      "path": "/alpha/search",
+      "method": "POST",
+      "request_keys": [
+        "commands",
+        "id",
+        "input",
+        "max_output_tokens",
+        "model",
+        "settings"
+      ],
+      "status": 200
+    },
+    {
+      "path": "/alpha/search",
+      "method": "POST",
+      "request_keys": [
+        "commands",
+        "id",
+        "input",
+        "max_output_tokens",
+        "model",
+        "settings"
+      ],
+      "status": 200
+    }
+  ],
+  "elapsed_seconds": 39.79,
+  "qq_send": false,
+  "image_generation": false,
+  "production_db_write": false,
+  "verification_environment": "All production systemd properties including UMask0077; actual configured Codex backend; search+open+image request prompt; production feature flags enabled"
+}

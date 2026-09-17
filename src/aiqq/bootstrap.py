@@ -35,6 +35,7 @@ from aiqq.services.agents import (
     PromptAuditAgent,
 )
 from aiqq.services.ai import CodexSDKBackend, ResponsesBackend
+from aiqq.services.chat_read import GroupChatReadService
 from aiqq.services.images import (
     GroupReferenceImageLoader,
     MCPClient,
@@ -70,14 +71,6 @@ def build_application(config: AppConfig) -> Application:
     prompt_auditor = PromptAuditAgent(backend)
     image_auditor = ImagePromptAuditAgent(backend)
     novelai_prompt_agent = NovelAIPromptAgent(backend)
-    chat_agent = ChatAgent(
-        backend,
-        system_prompt=config.ai.system_prompt,
-        web_search_enabled=config.ai.web_search_enabled,
-        gpt_image_skill_enabled=(
-            config.ai.backend == "codex_sdk" and config.ai.gpt_image_skill_enabled
-        ),
-    )
     gpt_images = CodexResponsesImageService(
         api_key=config.images.api_key,
         base_url=config.images.base_url,
@@ -114,6 +107,15 @@ def build_application(config: AppConfig) -> Application:
         repository=group_messages,
         downloader=web_images,
     )
+    chat_agent = ChatAgent(
+        backend,
+        system_prompt=config.ai.system_prompt,
+        web_search_enabled=config.ai.web_search_enabled,
+        gpt_image_skill_enabled=(
+            config.ai.backend == "codex_sdk" and config.ai.gpt_image_skill_enabled
+        ),
+        chat_read_service=GroupChatReadService(repository=group_messages, downloader=web_images),
+    )
     conversation = ConversationWorkflow(
         prompt_auditor=prompt_auditor,
         history_repository=group_messages,
@@ -125,8 +127,7 @@ def build_application(config: AppConfig) -> Application:
         web_image_service=(
             web_images if config.ai.web_image_search_enabled else None
         ),
-        history_message_limit=config.history.max_messages,
-        history_char_limit=config.history.max_chars,
+        history_message_limit=50,
     )
     gpt_image_workflow = GPTImageWorkflow(
         prompt_auditor=image_auditor,
@@ -190,6 +191,11 @@ def build_application(config: AppConfig) -> Application:
             gateway_snapshot=client.gateway_status.snapshot,
             database_is_open=lambda: group_messages.is_open,
             ai_backend=config.ai.backend,
+            message_storage_snapshot=group_messages.storage_status,
+            novelai_snapshot=lambda: {
+                "configured": novelai_images.is_configured,
+                "ready": novelai_images.is_ready,
+            },
         )
         web_application = create_web_application(
             health=health,

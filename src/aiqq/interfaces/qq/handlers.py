@@ -32,6 +32,7 @@ class IncomingGroupMessage:
     message_id: str
     member_openid: str
     content: str
+    has_attachments: bool = False
 
 
 class ConversationRunner(Protocol):
@@ -88,14 +89,16 @@ class GroupMessageHandler:
         self._reply_sender = reply_sender
         self._defer_after_seconds = defer_after_seconds
         self._command_handler = command_handler
-        self._seen_message_ids: dict[str, None] = {}
+        self._seen_message_ids: dict[tuple[str, str], None] = {}
         self._dedup_lock = asyncio.Lock()
         self._deferred_tasks: set[asyncio.Task[None]] = set()
 
     async def handle(self, message: IncomingGroupMessage) -> bool:
-        if not await self._claim(message.message_id):
+        if not await self._claim(message.group_id, message.message_id):
             return False
         prompt = clean_prompt(message.content)
+        if not prompt and message.has_attachments:
+            prompt = "请查看我这条消息中的图片或表情，并描述内容。"
         if not prompt:
             await self._sender.send_text_reply(
                 group_id=message.group_id,
@@ -171,13 +174,26 @@ class GroupMessageHandler:
                     "event=deferred_reply_start_failed error_type=%s",
                     type(exc).__name__,
                 )
-                await self._sender.send_text_reply(
-                    group_id=message.group_id,
-                    source_message_id=message.message_id,
-                    content=DEFERRED_LINK_UNAVAILABLE_TEXT,
-                    msg_seq=reporter.next_msg_seq,
+                self._track_deferred(
+                    self._complete_without_deferred(
+                        workflow_task,
+                        message,
+                        first_msg_seq=reporter.next_msg_seq + 1,
+                    )
                 )
-                self._track_deferred(self._drain_workflow(workflow_task))
+                try:
+                    await self._sender.send_text_reply(
+                        group_id=message.group_id,
+                        source_message_id=message.message_id,
+                        content=DEFERRED_LINK_UNAVAILABLE_TEXT,
+                        msg_seq=reporter.next_msg_seq,
+                        fallback_member_openid=message.member_openid,
+                    )
+                except Exception as notice_exc:
+                    logger.warning(
+                        "event=deferred_reply_notice_failed error_type=%s",
+                        type(notice_exc).__name__,
+                    )
                 return True
             self._track_deferred(
                 self._complete_deferred(workflow_task, deferred)
@@ -202,13 +218,18 @@ class GroupMessageHandler:
         finally:
             await reporter.finish()
 
-        await self._reply_sender.send(
-            result,
-            group_id=message.group_id,
-            source_message_id=message.message_id,
-            member_openid=message.member_openid,
-            first_msg_seq=reporter.next_msg_seq,
-        )
+        try:
+            await self._reply_sender.send(
+                result,
+                group_id=message.group_id,
+                source_message_id=message.message_id,
+                member_openid=message.member_openid,
+                first_msg_seq=reporter.next_msg_seq,
+            )
+        except Exception as exc:
+            logger.warning(
+                "event=group_reply_delivery_failed error_type=%s", type(exc).__name__
+            )
         return True
 
     def _track_deferred(self, coroutine: Awaitable[None]) -> None:
@@ -231,41 +252,61 @@ class GroupMessageHandler:
             logger.warning(
                 "event=deferred_conversation_failed error_type=%s", type(exc).__name__
             )
-            try:
-                await deferred.fail(CONVERSATION_UNAVAILABLE_TEXT)
-            except Exception as write_exc:
-                logger.warning(
-                    "event=deferred_reply_update_failed error_type=%s",
-                    type(write_exc).__name__,
-                )
-            return
+            result = ConversationResult(
+                "unavailable",
+                CONVERSATION_UNAVAILABLE_TEXT,
+                CONVERSATION_UNAVAILABLE_TEXT,
+                error_code="conversation_unavailable",
+            )
         try:
             await deferred.finish(result)
         except Exception as exc:
             logger.warning(
-                "event=deferred_reply_update_failed error_type=%s", type(exc).__name__
+                "event=deferred_reply_delivery_failed error_type=%s", type(exc).__name__
             )
 
-    @staticmethod
-    async def _drain_workflow(
+    async def _complete_without_deferred(
+        self,
         workflow_task: asyncio.Task[ConversationResult],
+        message: IncomingGroupMessage,
+        *,
+        first_msg_seq: int,
     ) -> None:
         try:
-            await workflow_task
+            result = await workflow_task
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning(
                 "event=deferred_conversation_unreported error_type=%s", type(exc).__name__
             )
+            result = ConversationResult(
+                "unavailable",
+                CONVERSATION_UNAVAILABLE_TEXT,
+                CONVERSATION_UNAVAILABLE_TEXT,
+                error_code="conversation_unavailable",
+            )
+        try:
+            await self._reply_sender.send(
+                result,
+                group_id=message.group_id,
+                source_message_id=message.message_id,
+                member_openid=message.member_openid,
+                first_msg_seq=first_msg_seq,
+            )
+        except Exception as exc:
+            logger.warning(
+                "event=deferred_reply_delivery_failed error_type=%s", type(exc).__name__
+            )
 
-    async def _claim(self, message_id: str) -> bool:
+    async def _claim(self, group_id: str, message_id: str) -> bool:
         if not message_id:
             return False
         async with self._dedup_lock:
-            if message_id in self._seen_message_ids:
+            key = (group_id, message_id)
+            if key in self._seen_message_ids:
                 return False
-            self._seen_message_ids[message_id] = None
+            self._seen_message_ids[key] = None
             if len(self._seen_message_ids) > MAX_TRACKED_MESSAGE_IDS:
                 self._seen_message_ids.pop(next(iter(self._seen_message_ids)))
             return True

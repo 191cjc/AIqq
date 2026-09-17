@@ -1,0 +1,12 @@
+{
+  "legacy_rows": 803,
+  "all_original_columns_and_ids_unchanged": true,
+  "idempotent": true,
+  "storage": {
+    "group_message_events": 0,
+    "message_versions": 803,
+    "message_attachments": 126,
+    "unprojected_events": 0,
+    "write_failures": 0
+  }
+}
