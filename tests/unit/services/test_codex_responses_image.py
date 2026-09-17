@@ -210,6 +210,32 @@ class CodexResponsesImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(sdk.backends[0].options["api_key"], sdk.backends[1].options["api_key"])
         self.assertEqual(len(requests), 2)
 
+    async def test_custom_dimensions_select_native_tool_size_and_exact_output(self):
+        for mode in ("generate", "edit"):
+            for dimensions, tool_size in (
+                ((800, 800), "1024x1024"),
+                ((1080, 1920), "1024x1536"),
+                ((1920, 1080), "1536x1024"),
+            ):
+                with self.subTest(mode=mode, dimensions=dimensions):
+                    service, _, requests = self.service(lambda _: response())
+                    action = ImageAction(
+                        mode,
+                        PROMPT,
+                        1 if mode == "edit" else None,
+                        width=dimensions[0],
+                        height=dimensions[1],
+                    )
+                    reference = validate_image(png_bytes()) if mode == "edit" else None
+                    image = await service.generate(
+                        action, reference_image=reference
+                    )
+                    tool = json.loads(requests[0].content)["tools"][0]
+                    self.assertEqual(tool["size"], tool_size)
+                    self.assertEqual((image.width, image.height), dimensions)
+                    with Image.open(BytesIO(image.data)) as actual:
+                        self.assertEqual(actual.size, dimensions)
+
     async def test_sse_handles_arbitrary_utf8_and_event_boundaries(self):
         item = image_item()
         payload = sse(

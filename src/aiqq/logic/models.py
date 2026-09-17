@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, Literal
 
 
@@ -15,8 +16,22 @@ PromptAuditCategory = Literal[
     "too_complex",
 ]
 ImageActionMode = Literal["generate", "edit"]
+ImageOrientation = Literal["square", "portrait", "landscape"]
+GPTImageSize = Literal["1024x1024", "1024x1536", "1536x1024"]
 ConversationStatus = Literal["ok", "rejected", "unavailable"]
 ImageUsageDenialReason = Literal["busy", "daily_limit"]
+DEFAULT_GPT_IMAGE_SIZE: GPTImageSize = "1024x1024"
+MIN_GPT_IMAGE_DIMENSION = 256
+MAX_GPT_IMAGE_DIMENSION = 2048
+MAX_GPT_IMAGE_PIXELS = 4_194_304
+GPT_IMAGE_DIMENSIONS: Mapping[GPTImageSize, tuple[int, int]] = MappingProxyType(
+    {
+        "1024x1024": (1024, 1024),
+        "1024x1536": (1024, 1536),
+        "1536x1024": (1536, 1024),
+    }
+)
+DEFAULT_GPT_IMAGE_DIMENSIONS = GPT_IMAGE_DIMENSIONS[DEFAULT_GPT_IMAGE_SIZE]
 
 
 @dataclass(frozen=True)
@@ -52,6 +67,8 @@ class ImageAction:
     mode: ImageActionMode
     prompt: str
     source_record_id: int | None = None
+    width: int | None = None
+    height: int | None = None
 
     def __post_init__(self) -> None:
         if not self.prompt.strip() or len(self.prompt) > 2000:
@@ -62,6 +79,25 @@ class ImageAction:
             self.source_record_id is None or self.source_record_id < 1
         ):
             raise ValueError("edit action requires a positive source record ID")
+        if (self.width is None) != (self.height is None):
+            raise ValueError("image width and height must be provided together")
+        if self.width is None:
+            return
+        if type(self.width) is not int or type(self.height) is not int:
+            raise ValueError("image dimensions must be integers")
+        if not (
+            MIN_GPT_IMAGE_DIMENSION <= self.width <= MAX_GPT_IMAGE_DIMENSION
+            and MIN_GPT_IMAGE_DIMENSION <= self.height <= MAX_GPT_IMAGE_DIMENSION
+        ):
+            raise ValueError("image dimensions are outside the supported range")
+        if self.width * self.height > MAX_GPT_IMAGE_PIXELS:
+            raise ValueError("image dimensions exceed the pixel limit")
+
+    @property
+    def target_dimensions(self) -> tuple[int, int]:
+        if self.width is None or self.height is None:
+            return DEFAULT_GPT_IMAGE_DIMENSIONS
+        return self.width, self.height
 
 
 @dataclass(frozen=True)
@@ -124,7 +160,7 @@ class ImagePromptAuditResult:
     category: Literal["safe", "adult_content"]
     reason: str
     suggested_prompt: str
-    orientation: Literal["square", "portrait", "landscape"]
+    orientation: ImageOrientation
 
     def __post_init__(self) -> None:
         if self.safe != (self.category == "safe"):

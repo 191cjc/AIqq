@@ -26,8 +26,10 @@ The common exception lives in `aiqq.exceptions`. `GPTImageError` specializes it 
 - Production uses `CodexResponsesImageService`: genuine Codex SDK/CLI → authenticated temporary loopback bridge → configured HTTPS `/responses`. Both generate and edit declare only `image_generation` and force that tool. Edit forwards the SDK-encoded reference image in Responses input.
 - The current provider restricts the image key to official Codex clients. Preserve genuine SDK headers; do not forge an official client identity on an ordinary HTTP call. Bridge requests accept only the per-attempt token, fixed path and configured driver model; the actual image key stays in the bridge.
 - `OPENAI_IMAGE_DRIVER_MODEL` defaults to `gpt-6-astra`, independently of the chat model. `OPENAI_IMAGE_MODEL` defaults to `gpt-image-2` and selects the hosted tool model. Current provider tests show `gpt-5.6-sol` routes through Responses Lite, which rejects `image_generation`; this is a provider-specific observation, not a universal model claim.
-- Tool defaults are `size="1024x1024"`, `quality="medium"`, `output_format="jpeg"`, compression 85. Editing retains `input_fidelity="high"`. Do not pass Images API fields such as `n` or `response_format` to the tool.
-- Require `response.completed` and a completed `image_generation_call.result`; validate its Base64 and actual image, then normalize to one 1024×1024 RGB JPEG. HTTP 200, an image-start event or text alone is not success. Parse SSE with bounded storage and correct fragmented UTF-8/event handling.
+- Ordinary-chat `image_action` owns optional custom `width` and `height`. Both fields are required-nullable in structured output: `null/null` means the deterministic 1024x1024 target; integers must be paired, each be within 256..2048, and total at most 4,194,304 pixels. Missing, partial, non-integer or out-of-range values are invalid agent output. Historical `ImageAction` construction without dimensions remains compatible with the square default.
+- The provider still accepts only `1024x1024`, `1024x1536`, or `1536x1024`. Select the native request size with the nearest symmetric aspect-ratio distance, then normalize locally to the exact custom target. Do not send arbitrary dimensions or provider `auto`. The explicit `/GPT生图` workflow has no skill dimension fields and remains 1024x1024. Image audit orientation remains for NovelAI and does not overwrite GPT action dimensions.
+- Tool defaults remain `quality="medium"`, `output_format="jpeg"`, compression 85. Editing retains `input_fidelity="high"`. Do not pass Images API fields such as `n` or `response_format` to the tool.
+- Require `response.completed` and a completed `image_generation_call.result`; validate its Base64 and actual image, then normalize to an RGB JPEG whose dimensions match the resolved target canvas, which can differ from the native request size. HTTP 200, an image-start event or text alone is not success. Parse SSE with bounded storage and correct fragmented UTF-8/event handling.
 - `OPENAI_IMAGE_API_KEY` and `OPENAI_IMAGE_BASE_URL` fall back independently to chat configuration. Verify the effective pair and model when diagnosing the provider; do not log the configuration object or credentials.
 - The adapter retries only HTTP 502, at most twice after delays of 0.5 and 1 second, for at most three generation/edit POSTs per business attempt. Each retry reuses the same model, prompt and reference bytes. All other HTTP statuses, timeouts, connection errors and invalid image responses stop without retry.
 - Image-only SDK mode disables request and stream retries and web tools. Image success comes from the captured Responses stream, independently of the SDK's final structured acknowledgement. Default chat/audit mode is unchanged and cannot invoke native image generation. Selective retries belong to the bridge and apply only to HTTP 502 before streaming. Accept one logical SDK request per attempt; reject additional SDK requests locally to avoid duplicate generation.
@@ -54,13 +56,14 @@ Both GPT workflows use `image_failure_result`; known errors produce `image_servi
 
 ## Good / Base / Bad Cases
 
-- Good: a valid Base64 response becomes one normalized 1024×1024 JPEG.
+- Good: a 1920x1080 chat action becomes a `1536x1024` request and a normalized 1920x1080 JPEG; `null/null` and direct-command generation remain deterministic 1024x1024 requests and results.
 - Base: a provider 404 records operation, attempt ID, status, provider request ID and a safe diagnostic, while QQ receives fixed text.
 - Bad: a provider echoes credentials, prompts, image data or HTML; raw content must not reach logs or QQ. Diagnostic metadata is bounded and cleaned.
 
 ## Required Tests
 
 - Use a fake SDK sender plus MockTransport to assert actual outgoing Responses tool schema, driver model, image credentials and reference input forwarding. Retain old AsyncOpenAI JSON/multipart tests for the legacy adapter.
+- Cover required-nullable custom dimensions, boundary and invalid combinations in the skill, chat Schema and domain object. Across ordinary-chat generation/edit and both adapters, assert that native request selection is nearest by aspect ratio while actual JPEG dimensions and `ImageAsset` metadata match the exact target. Keep explicit generation, historical actions and NovelAI regression coverage.
 - Cover authenticated path/model guards, duplicate SDK POST rejection, image-only SDK configuration and unchanged ordinary chat defaults.
 - Cover fragmented UTF-8 and SSE, response size limits, terminal failures/incompletion, valid completed image results and cleanup on cancellation/close/timeout.
 - Count actual transport requests for non-502 failures and timeouts to verify no retry.

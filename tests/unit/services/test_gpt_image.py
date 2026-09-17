@@ -18,6 +18,7 @@ from aiqq.services.images.gpt import (
     GPTImageService,
     MAX_ERROR_BODY_BYTES,
     SAFE_IMAGE_INSTRUCTION,
+    _resolve_image_size,
 )
 
 
@@ -77,12 +78,20 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(service.close)
         return service, requests
 
-    async def run_operation(self, service, operation="generate"):
+    async def run_operation(
+        self, service, operation="generate", *, width=None, height=None
+    ):
         reference = None
         if operation == "edit":
             reference = ImageAsset(base64.b64decode(encoded_png()), "image/png", 20, 10)
         return await service.generate(
-            ImageAction(operation, PROMPT, source_record_id=7 if operation == "edit" else None),
+            ImageAction(
+                operation,
+                PROMPT,
+                source_record_id=7 if operation == "edit" else None,
+                width=width,
+                height=height,
+            ),
             reference_image=reference,
         )
 
@@ -139,6 +148,48 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parts["image"].get_content_type(), "image/png")
         self.assertEqual(parts["image"].get_payload(decode=True), base64.b64decode(encoded_png()))
         self.assertEqual(log_fields(captured.records[-1])["operation"], "edit")
+
+    async def test_custom_dimensions_select_native_request_and_exact_output(self):
+        for operation in ("generate", "edit"):
+            for dimensions, request_size in (
+                ((800, 800), "1024x1024"),
+                ((1080, 1920), "1024x1536"),
+                ((1920, 1080), "1536x1024"),
+            ):
+                with self.subTest(operation=operation, dimensions=dimensions):
+                    service, requests = self.service(lambda _: image_response())
+                    asset = await self.run_operation(
+                        service, operation,
+                        width=dimensions[0], height=dimensions[1],
+                    )
+                    request = requests[0]
+                    if operation == "generate":
+                        actual_size = json.loads(request.content)["size"]
+                    else:
+                        actual_size = multipart_parts(request)["size"].get_payload(
+                            decode=True
+                        ).decode()
+                    self.assertEqual(actual_size, request_size)
+                    self.assertEqual((asset.width, asset.height), dimensions)
+                    with Image.open(BytesIO(asset.data)) as decoded:
+                        self.assertEqual(decoded.size, dimensions)
+
+    def test_native_size_selection_uses_symmetric_nearest_ratio(self):
+        for dimensions, expected in (
+            ((1000, 1224), "1024x1024"),
+            ((1000, 1225), "1024x1536"),
+            ((1224, 1000), "1024x1024"),
+            ((1225, 1000), "1536x1024"),
+        ):
+            with self.subTest(dimensions=dimensions):
+                request_size, target_size = _resolve_image_size(
+                    ImageAction(
+                        "generate", PROMPT,
+                        width=dimensions[0], height=dimensions[1],
+                    )
+                )
+                self.assertEqual(request_size, expected)
+                self.assertEqual(target_size, dimensions)
 
     async def test_missing_reference_does_not_post(self):
         service, requests = self.service(lambda _: image_response())

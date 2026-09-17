@@ -19,8 +19,12 @@ from pydantic import (
 
 from aiqq.exceptions import InvalidAgentOutput
 from aiqq.logic.models import (
+    MAX_GPT_IMAGE_DIMENSION,
+    MAX_GPT_IMAGE_PIXELS,
+    MIN_GPT_IMAGE_DIMENSION,
     ChatAgentOutput,
     ImageAction,
+    ImageOrientation,
     ImagePromptAuditResult,
     NovelAIPromptOptions,
     PromptAuditResult,
@@ -82,13 +86,27 @@ class _ImageActionOutput(_StrictOutput):
     mode: Literal["generate", "edit"]
     prompt: PromptText
     source_record_id: int | None = Field(ge=1)
+    width: int | None = Field(
+        ge=MIN_GPT_IMAGE_DIMENSION, le=MAX_GPT_IMAGE_DIMENSION
+    )
+    height: int | None = Field(
+        ge=MIN_GPT_IMAGE_DIMENSION, le=MAX_GPT_IMAGE_DIMENSION
+    )
 
     @model_validator(mode="after")
-    def validate_reference(self) -> "_ImageActionOutput":
+    def validate_action(self) -> "_ImageActionOutput":
         if self.mode == "generate" and self.source_record_id is not None:
             raise ValueError("generate cannot include a source record")
         if self.mode == "edit" and self.source_record_id is None:
             raise ValueError("edit requires a source record")
+        if (self.width is None) != (self.height is None):
+            raise ValueError("image width and height must be provided together")
+        if (
+            self.width is not None
+            and self.height is not None
+            and self.width * self.height > MAX_GPT_IMAGE_PIXELS
+        ):
+            raise ValueError("image dimensions exceed the pixel limit")
         return self
 
 
@@ -130,7 +148,7 @@ class _ImagePromptAuditOutput(_StrictOutput):
     category: Literal["safe", "adult_content"]
     reason: NonEmptyText
     suggested_prompt: Annotated[str, StringConstraints(strip_whitespace=True, max_length=2000)]
-    orientation: Literal["square", "portrait", "landscape"]
+    orientation: ImageOrientation
 
     @model_validator(mode="after")
     def validate_decision(self) -> "_ImagePromptAuditOutput":
@@ -236,6 +254,8 @@ def parse_chat_agent_output(
             mode=action.mode,
             prompt=action.prompt,
             source_record_id=action.source_record_id,
+            width=action.width,
+            height=action.height,
         )
     return ChatAgentOutput(
         full_text=value.full_text,

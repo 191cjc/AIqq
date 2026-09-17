@@ -17,6 +17,13 @@ image itself.
   state. Older protocol entries may use top-level `record_id` and `has_image`.
 - Otherwise set `image_action=null`. Questions about images and requests to find an
   existing web image are not generation requests.
+- Every non-null `image_action` must include `width` and `height`. Use the exact
+  requested dimensions when the user supplies valid integer dimensions. Otherwise,
+  choose dimensions only when the intended composition or use provides a reliable
+  choice; if it does not, set both fields to `null` for the 1024x1024 default.
+- `width` and `height` must either both be `null` or both be integers from 256 through
+  2048, and their product must not exceed 4194304. Never output `auto`, a dimension
+  string, only one dimension, or values outside these limits.
 - Never invent a record ID, local path, credential, QQ identifier, API parameter, or
   image result. Application code performs safety review, quota reservation, image
   generation, validation, storage, and delivery after the structured turn completes.

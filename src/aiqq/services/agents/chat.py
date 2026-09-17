@@ -47,8 +47,10 @@ URL、文件路径、附件名和 has_image 标记都不是已看过图片的证
 如果用户明确要求生成图片，image_action.mode=generate，prompt 给出可直接用于 GPT Images
 API 的独立完整提示词，source_record_id=null。如果用户明确要求修改参考资料中某张图片，
 mode=edit，并且 source_record_id 只能取本群当前/历史记录或读取工具中有图片且未撤回的真实 record_id。
-没有图片生成或编辑请求时 image_action=null。不得把图片二进制、本地路径、鉴权参数或 QQ 标识
-放入输出。
+非空 image_action 的 width、height 必须同时为 null 或同时为 256 至 2048 的整数，乘积不得
+超过 4194304；优先采用用户明确要求的合法尺寸，也可根据用途与构图决定，无法可靠决定时两项
+都填 null，由应用使用 1024x1024。不得输出 auto、尺寸字符串或单边尺寸。没有图片生成或编辑
+请求时 image_action=null。不得把图片二进制、本地路径、鉴权参数或 QQ 标识放入输出。
 
 需要最新信息或用户明确要求联网时可搜索。选择一张确实有帮助的现有网页图片时，
 selected_web_image_url 填写该图片的直接公共 HTTPS URL，否则为 null。sources 最多 3 项，

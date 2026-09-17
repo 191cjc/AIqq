@@ -63,6 +63,8 @@ class AgentSchemaTests(unittest.TestCase):
                 "mode": "edit",
                 "prompt": "make it blue",
                 "source_record_id": 7,
+                "width": None,
+                "height": None,
             },
             "selected_web_image_url": "https://images.example.com/a.jpg",
             "sources": [
@@ -73,6 +75,13 @@ class AgentSchemaTests(unittest.TestCase):
             json.dumps(base), allowed_image_record_ids=frozenset({7})
         )
         self.assertEqual(parsed.image_action.source_record_id, 7)
+        self.assertEqual(parsed.image_action.target_dimensions, (1024, 1024))
+
+        base["image_action"].update(width=1920, height=1080)
+        parsed = parse_chat_agent_output(
+            json.dumps(base), allowed_image_record_ids=frozenset({7})
+        )
+        self.assertEqual(parsed.image_action.target_dimensions, (1920, 1080))
 
         with self.assertRaises(InvalidAgentOutput):
             parse_chat_agent_output(json.dumps(base))
@@ -81,6 +90,51 @@ class AgentSchemaTests(unittest.TestCase):
             parse_chat_agent_output(
                 json.dumps(base), allowed_image_record_ids=frozenset({7})
             )
+
+    def test_chat_image_dimensions_are_required_nullable_and_bounded(self):
+        base = {
+            "full_text": "正在生成图片。",
+            "summary": "正在生成图片喵。",
+            "image_action": {
+                "mode": "generate",
+                "prompt": "cat",
+                "source_record_id": None,
+                "width": None,
+                "height": None,
+            },
+            "selected_web_image_url": None,
+            "sources": [],
+        }
+        for width, height in (
+            (None, None),
+            (256, 256),
+            (2048, 2048),
+            (1920, 1080),
+        ):
+            with self.subTest(width=width, height=height):
+                value = {**base, "image_action": {
+                    **base["image_action"], "width": width, "height": height,
+                }}
+                action = parse_chat_agent_output(json.dumps(value)).image_action
+                expected = (1024, 1024) if width is None else (width, height)
+                self.assertEqual(action.target_dimensions, expected)
+
+        invalid_actions = (
+            {key: value for key, value in base["image_action"].items() if key != "width"},
+            {**base["image_action"], "width": 1024, "height": None},
+            {**base["image_action"], "width": None, "height": 1024},
+            {**base["image_action"], "width": 255, "height": 1024},
+            {**base["image_action"], "width": 2049, "height": 1024},
+            {**base["image_action"], "width": True, "height": 1024},
+            {**base["image_action"], "width": 1024.0, "height": 1024},
+        )
+        for action in invalid_actions:
+            with self.subTest(action=action), self.assertRaises(InvalidAgentOutput):
+                parse_chat_agent_output(json.dumps({**base, "image_action": action}))
+
+        action_schema = CHAT_AGENT_OUTPUT_SCHEMA["$defs"]["_ImageActionOutput"]
+        self.assertIn("width", action_schema["required"])
+        self.assertIn("height", action_schema["required"])
 
     def test_chat_rejects_markdown_summary(self):
         value = {
@@ -94,19 +148,29 @@ class AgentSchemaTests(unittest.TestCase):
             parse_chat_agent_output(json.dumps(value))
 
     def test_image_audit_and_novelai_options_are_strict(self):
-        audit = parse_image_prompt_audit_output(
-            json.dumps(
-                {
-                    "safe": True,
-                    "effective": True,
-                    "category": "safe",
-                    "reason": "通过",
-                    "suggested_prompt": "",
-                    "orientation": "square",
-                }
-            )
-        )
-        self.assertTrue(audit.safe)
+        base = {
+            "safe": True,
+            "effective": True,
+            "category": "safe",
+            "reason": "通过",
+            "suggested_prompt": "",
+            "orientation": "square",
+        }
+        for orientation in ("square", "portrait", "landscape"):
+            with self.subTest(orientation=orientation):
+                audit = parse_image_prompt_audit_output(
+                    json.dumps({**base, "orientation": orientation})
+                )
+                self.assertTrue(audit.safe)
+                self.assertEqual(audit.orientation, orientation)
+        for invalid in (
+            {key: value for key, value in base.items() if key != "orientation"},
+            {**base, "orientation": None},
+            {**base, "orientation": "auto"},
+            {**base, "orientation": "1024x1536"},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(InvalidAgentOutput):
+                parse_image_prompt_audit_output(json.dumps(invalid))
 
         options = parse_novelai_prompt_options_output(
             json.dumps({"prompts": ["safe, cat", "safe, dog", "safe, bird"]})

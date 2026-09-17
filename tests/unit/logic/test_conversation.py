@@ -75,14 +75,14 @@ class FailingImageService:
 
 
 class FakeImageAuditor:
-    def __init__(self, *, safe=True, effective=True):
+    def __init__(self, *, safe=True, effective=True, orientation="square"):
         self.result = ImagePromptAuditResult(
             safe=safe,
             effective=effective,
             category="safe" if safe else "adult_content",
             reason="accepted" if safe and effective else "rejected",
             suggested_prompt="" if safe and effective else "safe, sfw, landscape",
-            orientation="square",
+            orientation=orientation,
         )
         self.calls = []
 
@@ -234,6 +234,52 @@ class ConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(image_auditor.calls, [("unsafe model prompt", False)])
         self.assertEqual(image_service.calls, [])
         self.assertEqual(usage.reserved, [])
+
+    async def test_skill_dimensions_survive_image_audit_for_generate_and_edit(self):
+        for mode, dimensions, audit_orientation in (
+            ("generate", (1920, 1080), "portrait"),
+            ("edit", (1080, 1920), "landscape"),
+            ("generate", (None, None), "square"),
+        ):
+            with self.subTest(mode=mode, dimensions=dimensions):
+                images = AsyncMock()
+                images.generate.return_value = MagicMock()
+                references = AsyncMock()
+                references.load.return_value = MagicMock()
+                workflow = ConversationWorkflow(
+                    prompt_auditor=FakeAuditor(),
+                    history_repository=FakeHistory(),
+                    conversation_agent=FakeChat(ChatAgentOutput(
+                        "正在处理图片。", "正在处理图片喵。",
+                        image_action=ImageAction(
+                            mode, "safe composition",
+                            source_record_id=7 if mode == "edit" else None,
+                            width=dimensions[0],
+                            height=dimensions[1],
+                        ),
+                    )),
+                    image_usage=FakeImageUsage(),
+                    image_service=images,
+                    image_prompt_auditor=FakeImageAuditor(
+                        orientation=audit_orientation
+                    ),
+                    reference_image_loader=references,
+                )
+
+                result = await workflow.run(
+                    group_id="group", before_message_id="message",
+                    conversation_key="key", user_input="make an image",
+                )
+
+                self.assertEqual(result.status, "ok")
+                generated_action = images.generate.await_args.args[0]
+                self.assertEqual(
+                    (generated_action.width, generated_action.height), dimensions
+                )
+                if mode == "edit":
+                    references.load.assert_awaited_once_with("group", 7)
+                else:
+                    references.load.assert_not_awaited()
 
     async def test_image_failures_share_classification_and_release_quota(self):
         for mode in ("generate", "edit"):

@@ -26,7 +26,6 @@ from aiqq.services.ai.codex_sdk import CodexSDKBackend
 from aiqq.services.images.gpt import (
     BAD_GATEWAY_RETRY_DELAYS,
     IMAGE_QUALITY,
-    IMAGE_SIZE,
     MAX_ERROR_BODY_BYTES,
     OUTPUT_COMPRESSION,
     SAFE_IMAGE_INSTRUCTION,
@@ -35,6 +34,7 @@ from aiqq.services.images.gpt import (
     _error_diagnostics,
     _log_event,
     _request_id,
+    _resolve_image_size,
     _safe_endpoint,
     _safe_label,
     _status_kind,
@@ -298,6 +298,8 @@ class CodexResponsesImageService:
     async def _run(
         self, state, action, reference_image, fields, secret_values, started
     ) -> ImageAsset:
+        image_size, target_size = _resolve_image_size(action)
+
         async def handle(request: web.Request) -> web.Response:
             authorization = request.headers.get("Authorization", "")
             if not authorization.isascii() or not hmac.compare_digest(
@@ -315,7 +317,7 @@ class CodexResponsesImageService:
                     raise GPTImageError("unexpected image driver model", kind="invalid_request")
                 tool = {
                     "type": "image_generation", "model": self.model,
-                    "size": IMAGE_SIZE, "quality": IMAGE_QUALITY,
+                    "size": image_size, "quality": IMAGE_QUALITY,
                     "output_format": "jpeg", "output_compression": OUTPUT_COMPRESSION,
                 }
                 if action.mode == "edit":
@@ -334,7 +336,8 @@ class CodexResponsesImageService:
                     "Accept-Encoding": "identity", "Content-Type": "application/json",
                 })
                 image, stream = await self._forward(
-                    state, body, headers, fields, secret_values, started
+                    state, body, headers, fields, secret_values, started,
+                    target_size,
                 )
                 state.finish(image)
                 return web.Response(body=stream, content_type="text/event-stream")
@@ -410,7 +413,9 @@ class CodexResponsesImageService:
             await runner.cleanup()
             state.result.cancel()
 
-    async def _forward(self, state, body, headers, fields, secret_values, started):
+    async def _forward(
+        self, state, body, headers, fields, secret_values, started, target_size
+    ):
         for retry_index in range(len(BAD_GATEWAY_RETRY_DELAYS) + 1):
             state.status, state.provider_request_id = None, None
             state.diagnostics = {}
@@ -445,9 +450,11 @@ class CodexResponsesImageService:
                         parser.feed(chunk)
                         chunks.append(chunk)
                     parser.feed(b"", final=True)
-                    image = await asyncio.to_thread(_decode_and_normalize, SimpleNamespace(
-                        data=[SimpleNamespace(b64_json=parser.encoded)]
-                    ))
+                    image = await asyncio.to_thread(
+                        _decode_and_normalize,
+                        SimpleNamespace(data=[SimpleNamespace(b64_json=parser.encoded)]),
+                        target_size,
+                    )
                     return image, b"".join(chunks)
             await _retry_sleep(delay)
         raise _invalid_response()

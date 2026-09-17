@@ -247,6 +247,19 @@ class CodexSDKBackendTests(unittest.IsolatedAsyncioTestCase):
             second_call["thread_options"]["model_reasoning_effort"], "high"
         )
 
+    def test_project_gpt_image_skill_defines_custom_dimension_contract(self):
+        skill = (
+            Path(__file__).resolve().parents[3]
+            / ".agents"
+            / "skills"
+            / "aiqq-gpt-image"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("`width` and `height`", skill)
+        self.assertIn("256 through", skill)
+        self.assertIn("4194304", skill)
+
     async def test_sdk_process_environment_is_an_explicit_allowlist(self):
         sdk = _FakeSDK((_successful_events(),))
         with tempfile.TemporaryDirectory() as root:

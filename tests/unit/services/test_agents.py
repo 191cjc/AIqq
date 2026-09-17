@@ -40,7 +40,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             '{"safe":true,"effective":true,"category":"safe",'
             '"reason":"ok","suggested_prompt":"","orientation":"square"}'
         )
-        await ImagePromptAuditAgent(image_backend).audit("cat")
+        image_audit = await ImagePromptAuditAgent(image_backend).audit("cat")
+        self.assertEqual(image_audit.orientation, "square")
         self.assertEqual(
             image_backend.calls[0]["output_schema"],
             IMAGE_PROMPT_AUDIT_OUTPUT_SCHEMA,
@@ -82,6 +83,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.full_text, "answer")
         self.assertEqual(backend.calls[0]["output_schema"], CHAT_AGENT_OUTPUT_SCHEMA)
         self.assertTrue(backend.calls[0]["enable_gpt_image_skill"])
+        self.assertIn("width、height", backend.calls[0]["instructions"])
+        self.assertIn("4194304", backend.calls[0]["instructions"])
         payload = json.loads(backend.calls[0]["model_input"])
         self.assertEqual(payload["protocol_version"], 3)
         self.assertEqual(payload["operation"], "chat")

@@ -5,7 +5,12 @@ from unittest.mock import AsyncMock
 from aiqq.exceptions import ImageAuditUnavailable, ImageGenerationUnavailable
 from aiqq.logic.image_generation import GPTImageWorkflow
 from aiqq.logic.image_quota import ImageQuotaManager
-from aiqq.logic.models import ImageAsset, ImagePromptAuditResult, ImageUsageDecision
+from aiqq.logic.models import (
+    ImageAction,
+    ImageAsset,
+    ImagePromptAuditResult,
+    ImageUsageDecision,
+)
 
 
 class FakeAuditor:
@@ -49,14 +54,14 @@ class FakeImageUsage:
         self.finished.append(key)
 
 
-def audit(*, safe=True, effective=True):
+def audit(*, safe=True, effective=True, orientation="square"):
     return ImagePromptAuditResult(
         safe=safe,
         effective=effective,
         category="safe" if safe else "adult_content",
         reason="ok" if safe and effective else "not allowed",
         suggested_prompt="" if safe and effective else "safe, sfw, landscape",
-        orientation="square",
+        orientation=orientation,
     )
 
 
@@ -72,8 +77,45 @@ class GPTImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "ok")
         self.assertEqual(len(result.images), 1)
         self.assertEqual(images.calls[0].prompt, "cat")
+        self.assertEqual(images.calls[0].target_dimensions, (1024, 1024))
         self.assertEqual(usage.recorded, ["group:g:member:u"])
         self.assertEqual(usage.finished, ["group:g:member:u"])
+
+    async def test_explicit_command_ignores_audit_orientation_and_defaults_square(self):
+        for orientation in (
+            "square",
+            "portrait",
+            "landscape",
+        ):
+            with self.subTest(orientation=orientation):
+                images = FakeImageService()
+                result = await GPTImageWorkflow(
+                    prompt_auditor=FakeAuditor(audit(orientation=orientation)),
+                    image_service=images,
+                    image_usage=FakeImageUsage(),
+                ).run("cat", conversation_key="key")
+                self.assertEqual(result.status, "ok")
+                self.assertEqual(images.calls[0].target_dimensions, (1024, 1024))
+
+    def test_image_action_validates_custom_dimensions(self):
+        self.assertEqual(
+            ImageAction("generate", "cat", width=256, height=2048).target_dimensions,
+            (256, 2048),
+        )
+        self.assertEqual(
+            ImageAction("generate", "cat", width=2048, height=2048).target_dimensions,
+            (2048, 2048),
+        )
+        for width, height in (
+            (None, 1024),
+            (1024, None),
+            (255, 1024),
+            (2049, 1024),
+            (True, 1024),
+            (1024.0, 1024),
+        ):
+            with self.subTest(width=width, height=height), self.assertRaises(ValueError):
+                ImageAction("generate", "cat", width=width, height=height)
 
     async def test_rejection_and_audit_failure_never_call_image_api(self):
         for auditor in (

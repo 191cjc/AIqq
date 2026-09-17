@@ -7,6 +7,7 @@ import base64
 import binascii
 import json
 import logging
+from math import log
 import re
 from io import BytesIO
 from time import monotonic
@@ -25,15 +26,19 @@ from openai import (
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from aiqq.exceptions import ImageGenerationUnavailable
-from aiqq.logic.models import ImageAction, ImageAsset
+from aiqq.logic.models import (
+    DEFAULT_GPT_IMAGE_SIZE,
+    GPT_IMAGE_DIMENSIONS,
+    GPTImageSize,
+    ImageAction,
+    ImageAsset,
+)
 from aiqq.services.images.validation import MAX_IMAGE_BYTES
 
 
 logger = logging.getLogger(__name__)
-IMAGE_SIZE = "1024x1024"
 IMAGE_QUALITY = "medium"
 OUTPUT_COMPRESSION = 85
-TARGET_SIZE = (1024, 1024)
 BAD_GATEWAY_RETRY_DELAYS = (0.5, 1.0)
 INPUT_EXTENSIONS = {
     "image/jpeg": "jpg",
@@ -113,11 +118,12 @@ class GPTImageService:
         diagnostics: dict[str, object] = {}
         _log_event("gpt_image_started", fields)
         try:
+            image_size, target_size = _resolve_image_size(action)
             request_params = {
                 "model": self.model,
                 "prompt": SAFE_IMAGE_INSTRUCTION + action.prompt,
                 "n": 1,
-                "size": IMAGE_SIZE,
+                "size": image_size,
                 "quality": IMAGE_QUALITY,
                 "output_format": "jpeg",
                 "output_compression": OUTPUT_COMPRESSION,
@@ -176,7 +182,9 @@ class GPTImageService:
                 raise GPTImageError(
                     "GPT image response is invalid", kind="invalid_response"
                 ) from exc
-            asset = await asyncio.to_thread(_decode_and_normalize, response)
+            asset = await asyncio.to_thread(
+                _decode_and_normalize, response, target_size
+            )
             outcome = "succeeded"
             kind = "none"
             return asset
@@ -347,7 +355,26 @@ def _error_diagnostics(
     return fields
 
 
-def _decode_and_normalize(response: Any) -> ImageAsset:
+def _resolve_image_size(
+    action: ImageAction,
+) -> tuple[GPTImageSize, tuple[int, int]]:
+    target_size = action.target_dimensions
+    target_width, target_height = target_size
+
+    def distance(image_size: GPTImageSize) -> tuple[float, bool]:
+        native_width, native_height = GPT_IMAGE_DIMENSIONS[image_size]
+        ratio_distance = abs(
+            log((target_width * native_height) / (target_height * native_width))
+        )
+        return ratio_distance, image_size != DEFAULT_GPT_IMAGE_SIZE
+
+    image_size = min(GPT_IMAGE_DIMENSIONS, key=distance)
+    return image_size, target_size
+
+
+def _decode_and_normalize(
+    response: Any, target_size: tuple[int, int]
+) -> ImageAsset:
     items = getattr(response, "data", None)
     if not isinstance(items, list) or not items:
         raise GPTImageError("GPT image response contains no image", kind="invalid_response")
@@ -374,13 +401,13 @@ def _decode_and_normalize(response: Any) -> ImageAsset:
                 rgb = background.convert("RGB")
             else:
                 rgb = oriented.convert("RGB")
-            fitted = ImageOps.contain(rgb, TARGET_SIZE, Image.Resampling.LANCZOS)
-            normalized = Image.new("RGB", TARGET_SIZE, "white")
+            fitted = ImageOps.contain(rgb, target_size, Image.Resampling.LANCZOS)
+            normalized = Image.new("RGB", target_size, "white")
             normalized.paste(
                 fitted,
                 (
-                    (TARGET_SIZE[0] - fitted.width) // 2,
-                    (TARGET_SIZE[1] - fitted.height) // 2,
+                    (target_size[0] - fitted.width) // 2,
+                    (target_size[1] - fitted.height) // 2,
                 ),
             )
             output = BytesIO()
@@ -397,4 +424,4 @@ def _decode_and_normalize(response: Any) -> ImageAsset:
     normalized_data = output.getvalue()
     if not normalized_data or len(normalized_data) > MAX_IMAGE_BYTES:
         raise GPTImageError("normalized GPT image size is invalid", kind="invalid_response")
-    return ImageAsset(normalized_data, "image/jpeg", *TARGET_SIZE)
+    return ImageAsset(normalized_data, "image/jpeg", *target_size)
