@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/chat-read.md", "reason": "Persist raw payload before normalization; runtime-name mention and dedup contract"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Raw event and SDK projection must reach the same command parser"}

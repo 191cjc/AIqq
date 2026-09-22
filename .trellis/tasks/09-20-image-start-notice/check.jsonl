@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/image-services.md", "reason": "Image admission, final delivery and expired-msgid contracts"}
+{"file": ".trellis/spec/backend/novelai-style.md", "reason": "Preserve personal style composition and NovelAI workflow behavior"}
+{"file": ".trellis/spec/backend/chat-read.md", "reason": "Preserve actual group/message context and history handling"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Share stable notification/sequence concepts"}
