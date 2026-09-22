@@ -145,7 +145,7 @@ class GroupMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_image_only_request_reaches_workflow_and_same_id_in_another_group_is_distinct(self):
         handler, workflow, sender, replies = self.make_handler()
         for group in ("group-1", "group-2"):
-            message = IncomingGroupMessage(group, "same-message-id", "member", "<@bot> ", True)
+            message = IncomingGroupMessage(group, "same-message-id", "member", "", True)
             self.assertTrue(await handler.handle(message))
             self.assertFalse(await handler.handle(message))
         self.assertEqual(len(workflow.calls), 2)
@@ -299,7 +299,7 @@ class GroupMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.images, (image,))
         self.assertEqual(context, {
             "group_id": "group-1", "source_message_id": "message-1",
-            "member_openid": "member-1", "first_msg_seq": 2,
+            "member_openid": "member-1", "first_msg_seq": 3,
         })
 
     async def test_deferred_page_failure_still_reports_late_workflow_failure(self):
@@ -347,6 +347,10 @@ class GroupMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
             ("@CurrentBot 你好", "你好"),
             ("  @CurrentBot你好", "你好"),
             ("@CurrentBot", ""),
+            ("[@CurrentBot] 你好", "你好"),
+            (" \t[@CurrentBot]你好", "你好"),
+            ("[@CurrentBot]", ""),
+            ("[@CurrentBot]\n/NovelAI生图 white cat,\n blue eyes", "/NovelAI生图 white cat,\n blue eyes"),
         ):
             with self.subTest(content=content):
                 payload = {"d": {"content": content, "mentions": []}}
@@ -366,6 +370,12 @@ class GroupMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
             "@Current",
             "@OldBot 你好",
             "@currentbot 你好",
+            "你好 [@CurrentBot]",
+            "[@Current] 你好",
+            "[@OldBot] 你好",
+            "[@currentbot] 你好",
+            "[@CurrentBotExtra] 你好",
+            "[@CurrentBot 你好",
             "普通消息",
         ):
             with self.subTest(content=content):
@@ -373,6 +383,42 @@ class GroupMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(
                     raw_event_mentions_bot(payload, bot_name="CurrentBot")
                 )
+                self.assertEqual(
+                    normalized_group_message_data(
+                        payload, bot_name="CurrentBot"
+                    )["content"],
+                    content,
+                )
+
+    def test_authoritative_native_name_is_used_without_removing_other_mentions(self):
+        for is_you, expected in (
+            (True, "/NovelAI生图 cat"),
+            (False, "[@KnownBot] /NovelAI生图 cat"),
+            (None, "[@KnownBot] /NovelAI生图 cat"),
+        ):
+            with self.subTest(is_you=is_you):
+                payload = {"d": {
+                    "content": "[@KnownBot] /NovelAI生图 cat",
+                    "mentions": [{"username": "KnownBot", "is_you": is_you}],
+                }}
+                self.assertEqual(raw_event_mentions_bot(
+                    payload, bot_name="CurrentBot"
+                ), is_you is True)
+                self.assertEqual(normalized_group_message_data(
+                    payload, bot_name="CurrentBot"
+                )["content"], expected)
+
+    def test_only_one_leading_mention_is_removed(self):
+        for prefix in ("<@bot-id>", "<@!bot-id>", "@CurrentBot", "[@CurrentBot]"):
+            for body in ("@CurrentBot hello", "[@CurrentBot] hello", "<@person> hello"):
+                with self.subTest(prefix=prefix, body=body):
+                    payload = {"d": {
+                        "content": f" \t{prefix}\n {body}  ",
+                        "mentions": [{"username": "CurrentBot", "is_you": True}],
+                    }}
+                    self.assertEqual(normalized_group_message_data(
+                        payload, bot_name="CurrentBot"
+                    )["content"], body)
 
     async def test_empty_text_mention_uses_existing_empty_or_image_flow(self):
         for has_attachments, expects_workflow in ((False, False), (True, True)):

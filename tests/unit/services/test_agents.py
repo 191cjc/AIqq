@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import AsyncMock
 
 from aiqq.exceptions import ConversationUnavailable, PromptAuditUnavailable
 from aiqq.logic.models import ConversationRequest, GroupHistoryMessage
@@ -12,6 +13,7 @@ from aiqq.services.agents.schemas import (
     CHAT_AGENT_OUTPUT_SCHEMA,
     IMAGE_PROMPT_AUDIT_OUTPUT_SCHEMA,
     NOVELAI_PROMPT_OPTIONS_OUTPUT_SCHEMA,
+    NOVELAI_TAG_QUERIES_OUTPUT_SCHEMA,
     PROMPT_AUDIT_OUTPUT_SCHEMA,
 )
 
@@ -47,12 +49,20 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             IMAGE_PROMPT_AUDIT_OUTPUT_SCHEMA,
         )
 
-        novel_backend = FakeBackend(
-            '{"prompts":["safe, cat","safe, dog","safe, bird"]}'
-        )
-        await NovelAIPromptAgent(novel_backend).generate("animal")
+        novel_backend = AsyncMock()
+        novel_backend.run.side_effect = [
+            AgentTurnResult('{"queries":["cat"]}'),
+            AgentTurnResult('{"prompts":["safe, cat","safe, dog","safe, bird"]}'),
+        ]
+        tag_search = AsyncMock()
+        tag_search.search.return_value = ()
+        await NovelAIPromptAgent(novel_backend, tag_search=tag_search).generate("animal")
         self.assertEqual(
-            novel_backend.calls[0]["output_schema"],
+            novel_backend.run.call_args_list[0].kwargs["output_schema"],
+            NOVELAI_TAG_QUERIES_OUTPUT_SCHEMA,
+        )
+        self.assertEqual(
+            novel_backend.run.call_args_list[1].kwargs["output_schema"],
             NOVELAI_PROMPT_OPTIONS_OUTPUT_SCHEMA,
         )
 

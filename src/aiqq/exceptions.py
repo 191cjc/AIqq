@@ -1,5 +1,7 @@
 """Application-level exception types."""
 
+from typing import Literal
+
 
 class AiQQError(Exception):
     """Base class for expected AiQQ failures."""
@@ -61,6 +63,10 @@ class ImageGenerationUnavailable(AiQQError):
         self.provider_request_id = provider_request_id
 
 
+class ImageContentRejected(AiQQError):
+    """QQ explicitly rejected an image upload or delivery for its content."""
+
+
 class ReferenceImageUnavailable(AiQQError):
     """No reference image could be loaded; contains only safe failure metadata."""
 
@@ -85,3 +91,17 @@ class ReferenceImageUnavailable(AiQQError):
 
 class NovelAIPromptUnavailable(AgentUnavailable):
     """Raised when NovelAI prompt generation cannot produce valid options."""
+
+
+class NovelAIPromptInvalidOutput(NovelAIPromptUnavailable):
+    """Model output failed validation at a known prompt-generation stage."""
+
+    def __init__(self, *, stage: Literal["planning", "authoring"]) -> None:
+        if stage not in {"planning", "authoring"}:
+            raise ValueError("Unknown NovelAI prompt stage")
+        self.stage = stage
+        super().__init__(f"NovelAI {stage} output failed validation")
+
+
+class NovelAITagSearchUnavailable(NovelAIPromptUnavailable):
+    """Danbooru tag lookup failed; do not silently author ungrounded options."""

@@ -172,6 +172,13 @@ class ImagePromptAuditResult:
 
 
 @dataclass(frozen=True)
+class DanbooruTag:
+    tag: str
+    category: Literal["general", "character", "copyright"]
+    post_count: int
+
+
+@dataclass(frozen=True)
 class NovelAIPromptOptions:
     prompts: tuple[str, str, str]
 

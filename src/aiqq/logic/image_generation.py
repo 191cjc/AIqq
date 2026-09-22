@@ -7,7 +7,12 @@ import logging
 from aiqq.exceptions import ImageAuditUnavailable, ImageGenerationUnavailable
 
 from .models import ConversationResult, ImageAction, ImageUsageDecision
-from .ports import GeneratedImageService, ImagePromptAuditor, ImageUsageLimiter
+from .ports import (
+    GeneratedImageService,
+    ImagePromptAuditor,
+    ImageStartCallback,
+    ImageUsageLimiter,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -39,7 +44,10 @@ class GPTImageWorkflow:
         self._image_service = image_service
         self._image_usage = image_usage
 
-    async def run(self, prompt: str, *, conversation_key: str) -> ConversationResult:
+    async def run(
+        self, prompt: str, *, conversation_key: str,
+        on_image_start: ImageStartCallback | None = None,
+    ) -> ConversationResult:
         normalized = prompt.strip()
         if not normalized:
             return ConversationResult(
@@ -69,6 +77,7 @@ class GPTImageWorkflow:
             return _quota_denied(decision)
 
         try:
+            await notify_image_start(on_image_start)
             image = await self._image_service.generate(ImageAction("generate", normalized))
             await self._image_usage.record_success(conversation_key)
         except ImageGenerationUnavailable as exc:
@@ -91,6 +100,18 @@ class GPTImageWorkflow:
         return ConversationResult(
             "ok", text, text, images=(image,),
             image_provenance={"provider": "gpt", "operation": "generate"},
+        )
+
+
+async def notify_image_start(callback: ImageStartCallback | None) -> None:
+    """A failed notification must not discard an admitted drawing request."""
+    if callback is None:
+        return
+    try:
+        await callback()
+    except Exception as exc:
+        logger.warning(
+            "event=image_start_notice_failed error_type=%s", type(exc).__name__
         )
 
 

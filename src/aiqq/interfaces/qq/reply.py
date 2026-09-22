@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from aiqq.exceptions import ImageContentRejected
 from aiqq.logic.models import ConversationResult, ImageAsset
 from aiqq.logic.ports import GroupMessageSender
 from aiqq.services.images.qq_upload import prepare_qq_image
@@ -20,9 +21,11 @@ logger = logging.getLogger(__name__)
 LONG_REPLY_THRESHOLD = 50
 FULL_REPLY_UNAVAILABLE_TEXT = "完整回答链接暂时不可用。"
 IMAGE_DELIVERY_FAILED_TEXT = "图片处理失败，暂时无法发送到 QQ。"
+IMAGE_CONTENT_REJECTED_TEXT = "QQ 返回“消息内容违规”，图片未能发送。请调整画面内容后重试。"
 DEFERRED_NOTICE_TEXT = "任务处理时间过长，后续进展请看这里"
 DEFERRED_INITIAL_TEXT = "# 任务处理中\n\nCodex 任务仍在继续执行。"
 DEFERRED_PROGRESS_HEADING = "# 任务处理中"
+IMAGE_START_NOTICE_TEXT = "已收到提示词，开始作画。"
 
 
 class ReplyExport(Protocol):
@@ -90,6 +93,19 @@ class ConversationReplySender:
         self._reply_store = reply_store
         self._media_store = media_store
 
+    async def send_image_start(
+        self, *, group_id: str, source_message_id: str,
+        member_openid: str, msg_seq: int,
+    ) -> None:
+        await self._sender.send_text_reply(
+            group_id=group_id,
+            source_message_id=source_message_id,
+            content=IMAGE_START_NOTICE_TEXT,
+            msg_seq=msg_seq,
+            fallback_member_openid=member_openid,
+            quote_source=True,
+        )
+
     async def start_deferred(
         self,
         *,
@@ -97,6 +113,7 @@ class ConversationReplySender:
         source_message_id: str,
         member_openid: str,
         first_msg_seq: int,
+        next_msg_seq: Callable[[], int] | None = None,
     ) -> DeferredReply:
         exported = await self._reply_store.create_pending(DEFERRED_INITIAL_TEXT)
         mention = f"<@{member_openid}> " if member_openid else ""
@@ -124,7 +141,9 @@ class ConversationReplySender:
                 group_id=group_id,
                 source_message_id=source_message_id,
                 member_openid=member_openid,
-                first_msg_seq=first_msg_seq + 1,
+                first_msg_seq=(
+                    next_msg_seq() if next_msg_seq is not None else first_msg_seq + 1
+                ),
                 full_reply_url=full_reply_url,
             )
 
@@ -194,6 +213,7 @@ class ConversationReplySender:
 
         for prepared in prepared_images:
             delivered = False
+            failure_text = IMAGE_DELIVERY_FAILED_TEXT
             if prepared is not None:
                 public_url, mime_type, metadata = prepared
                 try:
@@ -207,6 +227,11 @@ class ConversationReplySender:
                         image_metadata=metadata,
                     )
                     delivered = True
+                except ImageContentRejected:
+                    failure_text = IMAGE_CONTENT_REJECTED_TEXT
+                    logger.warning(
+                        "event=qq_image_delivery_failed error_kind=content_rejected"
+                    )
                 except Exception as exc:
                     logger.warning(
                         "event=qq_image_delivery_failed error_type=%s", type(exc).__name__
@@ -215,7 +240,7 @@ class ConversationReplySender:
                 await self._sender.send_text_reply(
                     group_id=group_id,
                     source_message_id=source_message_id,
-                    content=IMAGE_DELIVERY_FAILED_TEXT,
+                    content=failure_text,
                     msg_seq=next_sequence,
                     fallback_member_openid=member_openid,
                 )

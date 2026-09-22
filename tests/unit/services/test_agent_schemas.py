@@ -6,10 +6,12 @@ from aiqq.services.agents.schemas import (
     CHAT_AGENT_OUTPUT_SCHEMA,
     IMAGE_PROMPT_AUDIT_OUTPUT_SCHEMA,
     NOVELAI_PROMPT_OPTIONS_OUTPUT_SCHEMA,
+    NOVELAI_TAG_QUERIES_OUTPUT_SCHEMA,
     PROMPT_AUDIT_OUTPUT_SCHEMA,
     parse_chat_agent_output,
     parse_image_prompt_audit_output,
     parse_novelai_prompt_options_output,
+    parse_novelai_tag_queries_output,
     parse_prompt_audit_output,
 )
 
@@ -21,6 +23,7 @@ class AgentSchemaTests(unittest.TestCase):
             CHAT_AGENT_OUTPUT_SCHEMA,
             IMAGE_PROMPT_AUDIT_OUTPUT_SCHEMA,
             NOVELAI_PROMPT_OPTIONS_OUTPUT_SCHEMA,
+            NOVELAI_TAG_QUERIES_OUTPUT_SCHEMA,
         ):
             self.assertEqual(schema["type"], "object")
             self.assertIs(schema["additionalProperties"], False)
@@ -180,6 +183,47 @@ class AgentSchemaTests(unittest.TestCase):
             parse_novelai_prompt_options_output(
                 json.dumps({"prompts": ["same", "same", "same"]})
             )
+
+    def test_novelai_tag_queries_normalize_and_deduplicate_in_order(self):
+        self.assertEqual(
+            parse_novelai_tag_queries_output(json.dumps({
+                "queries": [
+                    " Blue  Hair ", "blue_hair", "1girl", "cat_(animal)",
+                    "fate/stay_night", "vocaloid+",
+                    "Hirogaru_Sky!_Precure", "bang_dream!",
+                ]
+            })),
+            (
+                "blue_hair", "1girl", "cat_(animal)", "fate/stay_night", "vocaloid+",
+                "hirogaru_sky!_precure", "bang_dream!",
+            ),
+        )
+        self.assertEqual(
+            len(parse_novelai_tag_queries_output(json.dumps({
+                "queries": [f"scene_{index}" for index in range(8)]
+            }))),
+            8,
+        )
+
+    def test_novelai_tag_queries_reject_unbounded_or_invalid_plans(self):
+        invalid = [
+            {},
+            {"queries": []},
+            {"queries": ["cat"] * 9},
+            {"queries": ["cat"], "tools": []},
+            {"queries": "cat"},
+            {"queries": [False]},
+            {"queries": ["x" * 81]},
+            {"queries": [" " + "x" * 80]},
+        ]
+        invalid.extend({"queries": [query]} for query in (
+            "", "   ", "猫", "blue\nhair", "\tcat", "cat\r", "cat\x7f",
+            "cat,dog", "rating:safe", "cat*", "~cat", "-cat", "cat|dog",
+            "cat&dog", "cat;dog", "cat=dog", "123", "!cat", "cat?", "cat\\dog",
+        ))
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(InvalidAgentOutput):
+                parse_novelai_tag_queries_output(json.dumps(value))
 
 
 if __name__ == "__main__":

@@ -185,7 +185,7 @@ class CodexResponsesImageTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(tool["type"], "image_generation")
                 self.assertEqual(tool["model"], "gpt-image-2")
                 self.assertEqual(tool["size"], "1024x1024")
-                self.assertEqual(tool["quality"], "medium")
+                self.assertEqual(tool["quality"], "high")
                 self.assertEqual(tool["output_compression"], 85)
                 self.assertEqual(tool["output_format"], "jpeg")
                 self.assertEqual(tool.get("input_fidelity"), "high" if reference else None)

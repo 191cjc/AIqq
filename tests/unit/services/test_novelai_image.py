@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock
 from PIL import Image
 
 from aiqq.exceptions import ImageGenerationUnavailable
+from aiqq.logic.models import ImagePromptAuditResult, ImageUsageDecision
+from aiqq.logic.novelai import NovelAIImageWorkflow
 from aiqq.services.images.novelai import (
     NOVELAI_IMAGE_SIZES,
     NOVELAI_STEPS,
@@ -152,6 +154,41 @@ class NovelAIServiceTests(unittest.IsolatedAsyncioTestCase):
             NOVELAI_IMAGE_SIZES["portrait"],
         )
         self.assertEqual(arguments["steps"], NOVELAI_STEPS)
+
+    async def test_styled_workflow_preserves_service_safety_prefix(self):
+        client = FakeMCPClient(image_result())
+        service = NovelAIService(client)
+        await service.initialize()
+        styles = AsyncMock()
+        styles.load.return_value = "{watercolor},\nsoft lighting"
+        auditor = AsyncMock()
+        auditor.audit.return_value = ImagePromptAuditResult(
+            True, True, "safe", "safe scene", "", "square"
+        )
+        usage = AsyncMock()
+        usage.reserve_attempt.return_value = ImageUsageDecision(True)
+        workflow = NovelAIImageWorkflow(
+            prompt_auditor=auditor, image_service=service,
+            image_usage=usage, styles=styles,
+        )
+
+        result = await workflow.run(
+            " white cat ", conversation_key="group:one:member:one",
+            member_openid="one",
+        )
+
+        self.assertEqual(result.status, "ok")
+        styles.load.assert_awaited_once_with("one")
+        auditor.audit.assert_awaited_once_with(
+            "{watercolor},\nsoft lighting, white cat", require_english=True
+        )
+        self.assertEqual(len(client.calls), 1)
+        name, arguments = client.calls[0]
+        self.assertEqual(name, "generate_image")
+        self.assertEqual(
+            arguments["prompt"],
+            "rating:general, safe, sfw, {watercolor},\nsoft lighting, white cat",
+        )
 
     async def test_invalid_or_mime_mismatched_image_is_rejected(self):
         for result in (

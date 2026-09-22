@@ -11,11 +11,14 @@ from unittest.mock import AsyncMock, patch
 from urllib.parse import urlsplit
 
 from PIL import Image
+from botpy.api import BotAPI
 from botpy.errors import ServerError
+from botpy.http import _handle_response
 
 from aiqq.interfaces.qq.reply import (
     DEFERRED_NOTICE_TEXT,
     FULL_REPLY_UNAVAILABLE_TEXT,
+    IMAGE_CONTENT_REJECTED_TEXT,
     IMAGE_DELIVERY_FAILED_TEXT,
     ConversationReplySender,
 )
@@ -84,6 +87,41 @@ class FakeMediaStore:
     async def save(self, image):
         self.saved.append(image)
         return SimpleNamespace(public_url="https://public.example/media/token.jpg")
+
+
+class ImageRejectionHttp:
+    """Drive actual SDK serialization/error parsing without a live QQ request."""
+
+    def __init__(self, stage, *, expiry=None):
+        self.stage = stage
+        self.expiry = expiry
+        self.payloads = []
+        self.uploads = []
+        self.image_sends = 0
+
+    async def request(self, route, **kwargs):
+        payload = kwargs["json"]
+        if route.path.endswith("/files"):
+            self.uploads.append(payload)
+            if self.stage == "upload":
+                return await self.reject(route, 40034006, "消息内容违规")
+            return {"file_info": "uploaded-once"}
+        self.payloads.append(payload)
+        if payload["msg_type"] == 7:
+            self.image_sends += 1
+            if self.expiry is not None and self.image_sends == 1:
+                return await self.reject(route, *self.expiry)
+            return await self.reject(route, 40034006, "消息内容违规")
+        return {"id": f"text-{len(self.payloads)}"}
+
+    @staticmethod
+    async def reject(route, code, message):
+        return await _handle_response(SimpleNamespace(
+            status=400,
+            request_info=SimpleNamespace(url=route.url),
+            headers={"content-type": "application/json"},
+            json=AsyncMock(return_value={"message": message, "code": code, "err_code": code}),
+        ))
 
 
 class ConversationReplySenderTests(unittest.IsolatedAsyncioTestCase):
@@ -391,6 +429,91 @@ class ConversationReplySenderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sender.image_calls[0]["msg_seq"], 3)
         self.assertEqual(sender.text_calls[0]["content"], IMAGE_DELIVERY_FAILED_TEXT)
         self.assertEqual(sender.text_calls[0]["fallback_member_openid"], "member")
+
+    async def test_sdk_content_rejection_reaches_foreground_and_deferred_user_copy(self):
+        stages = (
+            ("upload", None),
+            ("send", None),
+            ("send", (40034031, "msgid已经过期,不能回复")),
+            ("send", (40034005, "回复消息msg_id已过期")),
+        )
+        for (stage, expiry), is_deferred in product(stages, (False, True)):
+            with self.subTest(stage=stage, expiry=expiry, deferred=is_deferred):
+                http = ImageRejectionHttp(stage, expiry=expiry)
+                repository = SimpleNamespace(
+                    add_bot_message=AsyncMock(return_value=True),
+                    record_delivery_attempt=AsyncMock(return_value=1),
+                )
+                sender = QQMessageSender(BotAPI(http), repository, bot_username="AiQQ")
+                presenter, _sender = self.make_presenter(sender=sender)
+                image = ImageAsset(b"image", "image/jpeg", 1, 1)
+                result = ConversationResult("ok", "answer", "answer", images=(image,))
+                context = dict(group_id="group", source_message_id="source",
+                               member_openid="member", first_msg_seq=2)
+
+                with self.assertLogs("aiqq.interfaces.qq.reply", level="WARNING") as logs:
+                    if is_deferred:
+                        deferred = await presenter.start_deferred(**context)
+                        await deferred.finish(result)
+                    else:
+                        self.assertEqual(await presenter.send(result, **context), 4)
+
+                self.assertEqual([record.getMessage() for record in logs.records], [
+                    "event=qq_image_delivery_failed error_kind=content_rejected"
+                ])
+                self.assertEqual(len(http.uploads), 1)
+                expected_image_sends = 0 if stage == "upload" else (2 if expiry else 1)
+                self.assertEqual(http.image_sends, expected_image_sends)
+                self.assertEqual(len(http.payloads), expected_image_sends + 2 + int(is_deferred))
+                notice = http.payloads[-1]
+                self.assertEqual(notice["msg_type"], 0)
+                self.assertEqual(notice["content"], IMAGE_CONTENT_REJECTED_TEXT)
+                self.assertEqual(notice["group_openid"], "group")
+                self.assertEqual(notice["msg_id"], "source")
+                self.assertEqual(notice["msg_seq"], 4 if is_deferred else 3)
+                image_payloads = [p for p in http.payloads if p["msg_type"] == 7]
+                if expiry:
+                    self.assertEqual(image_payloads[0]["media"], image_payloads[1]["media"])
+                    self.assertIsNone(image_payloads[1]["msg_id"])
+                    self.assertIsNone(image_payloads[1]["msg_seq"])
+                for payload in image_payloads:
+                    self.assertIsNone(payload["content"])
+                saved = [call.kwargs for call in repository.add_bot_message.await_args_list]
+                self.assertEqual(len(saved), 2 + int(is_deferred))
+                self.assertTrue(all(record["message_type"] != 7 for record in saved))
+                self.assertEqual(saved[-1]["content"], IMAGE_CONTENT_REJECTED_TEXT)
+                self.assertEqual(saved[-1]["source_message_id"], "source")
+                failures = [
+                    call.kwargs for call in repository.record_delivery_attempt.await_args_list
+                    if call.kwargs["status"] == "failed"
+                ]
+                self.assertEqual(len(failures), 2 if expiry else 1)
+                self.assertTrue(all(call["error_type"] == "ServerError" for call in failures))
+
+    async def test_unclassified_image_errors_keep_generic_copy_and_cancel_propagates(self):
+        for error in (ServerError("消息内容违规; private details"), RuntimeError("消息内容违规"),
+                      TimeoutError("private failure"), asyncio.CancelledError()):
+            with self.subTest(error=repr(error)):
+                sender = FakeSender()
+                sender.image_error = error
+                presenter, _sender = self.make_presenter(sender=sender)
+                call = presenter.send(
+                    ConversationResult("ok", "answer", "answer", images=(
+                        ImageAsset(b"image", "image/jpeg", 1, 1),
+                    )),
+                    group_id="group", source_message_id="source", member_openid="member",
+                    first_msg_seq=2,
+                )
+                if isinstance(error, asyncio.CancelledError):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await call
+                    self.assertEqual(sender.text_calls, [])
+                else:
+                    with self.assertLogs("aiqq.interfaces.qq.reply", level="WARNING") as logs:
+                        self.assertEqual(await call, 4)
+                    self.assertEqual(sender.text_calls[0]["content"], IMAGE_DELIVERY_FAILED_TEXT)
+                    self.assertNotIn("private", " ".join(logs.output))
+                self.assertEqual(len(sender.image_calls), 1)
 
     async def test_large_image_is_stored_as_jpeg_before_qq_upload(self):
         with Image.new("RGB", (1200, 800), "blue") as source:

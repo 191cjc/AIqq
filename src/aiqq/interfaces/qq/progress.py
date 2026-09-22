@@ -41,6 +41,12 @@ class QQProgressReporter:
     def next_msg_seq(self) -> int:
         return self._next_msg_seq
 
+    def reserve_msg_seq(self) -> int:
+        """Consume a sequence before transport, even if its outcome is ambiguous."""
+        sequence = self._next_msg_seq
+        self._next_msg_seq += 1
+        return sequence
+
     async def publish(self, content: str) -> None:
         async with self._lock:
             if (
@@ -60,10 +66,9 @@ class QQProgressReporter:
                 group_id=self._group_id,
                 source_message_id=self._source_message_id,
                 content=content,
-                msg_seq=self._next_msg_seq,
+                msg_seq=self.reserve_msg_seq(),
                 progress=True,
             )
-            self._next_msg_seq += 1
             self._published_count += 1
             self._current = sent
             if not sent.recorded:

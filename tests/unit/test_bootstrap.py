@@ -3,10 +3,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aiqq.bootstrap import build_application
 from aiqq.config import AppConfig
+from aiqq.logic.ports import AgentTurnResult
 from aiqq.services.images.codex_responses import CodexResponsesImageService
 
 
@@ -52,9 +53,25 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 conversation._image_usage,
                 router._novelai_image_workflow._image_usage,
             )
+            self.assertIs(
+                router._novelai_style_workflow._styles,
+                router._novelai_image_workflow._styles,
+            )
             novelai_service = router._novelai_image_workflow._image_service
             self.assertFalse(novelai_service.is_configured)
             self.assertFalse(novelai_service.is_ready)
+            self.assertIs(
+                router._novelai_prompt_workflow._prompt_agent._tag_search._client,
+                novelai_service._client,
+            )
+            self.assertIs(
+                router._novelai_quick_image_workflow._prompt_workflow,
+                router._novelai_prompt_workflow,
+            )
+            self.assertIs(
+                router._novelai_quick_image_workflow._image_workflow,
+                router._novelai_image_workflow,
+            )
             route_paths = {
                 route.resource.canonical
                 for route in components.web_application.router.routes()
@@ -62,10 +79,28 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("/group-messages", route_paths)
             self.assertIn("/internal/group-messages", route_paths)
 
-            for initialize in components.initializers:
-                await initialize()
-            self.assertTrue(Path(directory, "state.db").is_file())
-            await asyncio.gather(*(close() for close in components.closers))
+            try:
+                for initialize in components.initializers:
+                    await initialize()
+                self.assertTrue(Path(directory, "state.db").is_file())
+                saved = await router._novelai_style_workflow.run(
+                    "watercolor, soft lighting", member_openid="member"
+                )
+                self.assertEqual(saved.status, "ok")
+            finally:
+                await asyncio.gather(*(close() for close in components.closers))
+
+            restarted = build_application(config).client._components
+            try:
+                for initialize in restarted.initializers:
+                    await initialize()
+                restarted_router = restarted.message_handler._command_handler
+                self.assertEqual(
+                    await restarted_router._novelai_image_workflow._styles.load("member"),
+                    "watercolor, soft lighting",
+                )
+            finally:
+                await asyncio.gather(*(close() for close in restarted.closers))
 
     async def test_explicit_novelai_url_and_private_token_file_wire_ready_service(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -135,6 +170,44 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
                         [call.args[0]["method"] for call in request.await_args_list],
                         ["initialize", "notifications/initialized", "tools/list"],
                     )
+                    prompt_workflow = (
+                        components.message_handler._command_handler._novelai_prompt_workflow
+                    )
+                    agent = prompt_workflow._prompt_agent
+                    self.assertIs(agent._tag_search._client, service._client)
+                    request.side_effect = [
+                        ({"result": {}}, "tag-session"),
+                        ({}, "tag-session"),
+                        ({"result": {"structuredContent": {"result": [
+                            {"tag": "blue_hair", "category": "general", "post_count": 1000},
+                            {"tag": "artist_name", "category": "artist", "post_count": 2000},
+                        ]}, "isError": False}}, "tag-session"),
+                    ]
+                    with patch.object(agent._backend, "run", new=AsyncMock(side_effect=[
+                        AgentTurnResult(json.dumps({
+                            "safe": True, "effective": True, "category": "safe",
+                            "reason": "safe scene", "suggested_prompt": "",
+                            "orientation": "square",
+                        })),
+                        AgentTurnResult('{"queries":["blue_hair"]}'),
+                        AgentTurnResult(json.dumps({"prompts": [
+                            "blue_hair, garden, safe, sfw, fully clothed",
+                            "blue_hair, park, safe, sfw, fully clothed",
+                            "blue_hair, window, safe, sfw, fully clothed",
+                        ]})),
+                    ])) as model:
+                        output = await prompt_workflow.create(
+                            "a blue-haired person", conversation_key="group:test:member:test"
+                        )
+                    self.assertEqual(output.result.status, "ok")
+                    self.assertIsNotNone(output.session)
+                    reference = json.loads(model.await_args_list[-1].kwargs["model_input"])
+                    self.assertIn("blue_hair", str(reference["tag_reference"]))
+                    self.assertNotIn("artist_name", str(reference["tag_reference"]))
+                    call = request.await_args_list[-1].args[0]
+                    self.assertEqual(call["method"], "tools/call")
+                    self.assertEqual(call["params"]["name"], "suggest_tags")
+                    self.assertEqual(call["params"]["arguments"], {"query": "blue_hair", "limit": 8})
                 finally:
                     await asyncio.gather(*(close() for close in components.closers))
 

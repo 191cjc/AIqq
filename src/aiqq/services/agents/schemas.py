@@ -30,6 +30,7 @@ from aiqq.logic.models import (
     PromptAuditResult,
     SourceReference,
 )
+from aiqq.services.novelai_tag_query import normalize_novelai_tag_query
 
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -53,6 +54,7 @@ NovelPromptText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
 ]
+NovelTagQueryText = Annotated[str, StringConstraints(min_length=1, max_length=80)]
 
 
 class _StrictOutput(BaseModel):
@@ -172,6 +174,20 @@ class _NovelAIPromptOptionsOutput(_StrictOutput):
         return prompts
 
 
+class _NovelAITagQueriesOutput(_StrictOutput):
+    queries: list[NovelTagQueryText] = Field(min_length=1, max_length=8)
+
+    @field_validator("queries")
+    @classmethod
+    def validate_queries(cls, queries: list[str]) -> list[str]:
+        normalized = []
+        for query in queries:
+            query = normalize_novelai_tag_query(query)
+            if query not in normalized:
+                normalized.append(query)
+        return normalized
+
+
 def _schema(model: type[BaseModel]) -> dict[str, object]:
     schema = model.model_json_schema(mode="validation")
     schema.pop("title", None)
@@ -182,6 +198,7 @@ PROMPT_AUDIT_OUTPUT_SCHEMA = _schema(_PromptAuditOutput)
 CHAT_AGENT_OUTPUT_SCHEMA = _schema(_ChatOutput)
 IMAGE_PROMPT_AUDIT_OUTPUT_SCHEMA = _schema(_ImagePromptAuditOutput)
 NOVELAI_PROMPT_OPTIONS_OUTPUT_SCHEMA = _schema(_NovelAIPromptOptionsOutput)
+NOVELAI_TAG_QUERIES_OUTPUT_SCHEMA = _schema(_NovelAITagQueriesOutput)
 
 
 def _validate_public_https_url(value: str) -> str:
@@ -284,3 +301,9 @@ def parse_novelai_prompt_options_output(raw: str) -> NovelAIPromptOptions:
     assert isinstance(value, _NovelAIPromptOptionsOutput)
     prompts = tuple(value.prompts)
     return NovelAIPromptOptions((prompts[0], prompts[1], prompts[2]))
+
+
+def parse_novelai_tag_queries_output(raw: str) -> tuple[str, ...]:
+    value = _parse(_NovelAITagQueriesOutput, raw, "novelai_tag_queries")
+    assert isinstance(value, _NovelAITagQueriesOutput)
+    return tuple(value.queries)

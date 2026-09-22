@@ -12,6 +12,7 @@ from typing import Any
 from botpy.errors import ServerError
 from botpy.http import Route
 
+from aiqq.exceptions import ImageContentRejected
 from aiqq.logic.models import BotSentGroupMessage
 from aiqq.logic.ports import BotMessageRepository
 
@@ -70,7 +71,14 @@ class QQMessageSender:
         progress: bool = False,
         origin: str = "conversation",
         fallback_member_openid: str = "",
+        quote_source: bool = False,
     ) -> BotSentGroupMessage:
+        request: dict[str, Any] = {"content": content}
+        if quote_source and source_message_id:
+            request["message_reference"] = {
+                "message_id": source_message_id,
+                "ignore_get_message_error": True,
+            }
         return await self._send_and_record(
             group_id=group_id,
             source_message_id=source_message_id,
@@ -78,7 +86,7 @@ class QQMessageSender:
             message_type=0,
             visible_content=content,
             record_content=content,
-            request={"content": content},
+            request=request,
             progress=progress,
             origin=origin,
             fallback_member_openid=fallback_member_openid,
@@ -311,6 +319,15 @@ class QQMessageSender:
             raise
         except Exception as exc:
             await self._record_attempt(**context, status="failed", error_type=type(exc).__name__)
+            if (
+                isinstance(exc, ServerError)
+                and str(exc) == "消息内容违规"
+                and (
+                    operation == "upload_image"
+                    or (operation == "send_message" and parameters.get("msg_type") == 7)
+                )
+            ):
+                raise ImageContentRejected("QQ rejected image content") from exc
             raise
         await self._record_attempt(
             **context, status="succeeded", result=_business_response(response),

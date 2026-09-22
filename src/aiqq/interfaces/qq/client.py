@@ -115,7 +115,9 @@ class AiQQClient(botpy.Client):
             logger.info("event=aiqq_ready bot_name=%s", self._bot_name)
 
     async def on_group_at_message_create(self, message: GroupMessage) -> None:
-        await self._components.message_handler.handle(_incoming(message))
+        await self._components.message_handler.handle(
+            _incoming(message, bot_name=self._bot_name)
+        )
 
     async def on_group_msg_receive(self, _event: object) -> None:
         logger.info("event=qq_full_group_messages_enabled")
@@ -148,14 +150,16 @@ class AiQQClient(botpy.Client):
             payload, bot_name=self._bot_name
         ):
             return
-        data = normalized_group_message_data(payload, bot_name=self._bot_name)
-        if data is None:
+        data = payload.get("d")
+        if not isinstance(data, dict):
             return
         message = GroupMessage(self.api, payload.get("id"), data)
         # Persist before dispatch, but never block gateway capture while a model
         # turn is running. The handler owns shared raw/SDK group+message dedup.
         task = asyncio.create_task(
-            self._components.message_handler.handle(_incoming(message, raw_data=data)),
+            self._components.message_handler.handle(
+                _incoming(message, bot_name=self._bot_name, raw_data=data)
+            ),
             name="aiqq-group-message",
         )
         self._message_tasks.add(task)
@@ -238,13 +242,25 @@ class AiQQClient(botpy.Client):
         await super().close()
 
 
-def _incoming(message: GroupMessage, *, raw_data: dict[str, Any] | None = None) -> IncomingGroupMessage:
+def _incoming(
+    message: GroupMessage,
+    *,
+    bot_name: str = DEFAULT_BOT_NAME,
+    raw_data: dict[str, Any] | None = None,
+) -> IncomingGroupMessage:
     author = getattr(message, "author", None)
+    # Raw receipts retain authoritative mention names and nested attachments;
+    # botpy's SDK projection loses them. Both paths normalize exactly once here.
+    data = {"content": str(getattr(message, "content", "") or "")}
+    if raw_data is not None:
+        data.update(raw_data)
+    normalized = normalized_group_message_data({"d": data}, bot_name=bot_name)
+    assert normalized is not None
     return IncomingGroupMessage(
         group_id=str(getattr(message, "group_openid", "") or ""),
         message_id=str(getattr(message, "id", "") or ""),
         member_openid=str(getattr(author, "member_openid", "") or ""),
-        content=str(getattr(message, "content", "") or ""),
+        content=normalized["content"],
         has_attachments=bool(getattr(message, "attachments", None)) or _has_attachments(raw_data),
     )
 

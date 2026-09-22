@@ -1,5 +1,114 @@
 # GPT Image Service Contract
 
+## Image Generation Start Notice
+
+### Scope and signatures
+
+Explicit GPT/NovelAI workflows and conversational GPT generation/edit accept an
+optional no-argument async `on_image_start` callback. This is an application
+event, separate from model-generated/capped temporary progress messages. The QQ
+interface owns the fixed plain-text message `已收到提示词，开始作画。`.
+
+```python
+ImageStartCallback = Callable[[], Awaitable[None]]
+async def notify_image_start(callback: ImageStartCallback | None) -> None: ...
+
+class QQProgressReporter:
+    def reserve_msg_seq(self) -> int: ...
+
+class ConversationReplySender:
+    async def send_image_start(
+        self, *, group_id: str, source_message_id: str,
+        member_openid: str, msg_seq: int,
+    ) -> None: ...
+
+    # Optional getter resolves at completion; old callers remain valid.
+    async def start_deferred(
+        self, *, group_id: str, source_message_id: str,
+        member_openid: str, first_msg_seq: int,
+        next_msg_seq: Callable[[], int] | None = None,
+    ) -> DeferredReply: ...
+
+# GroupMessageSender/QQMessageSender text API adds an opt-in quote flag:
+async def send_text_reply(
+    *, group_id: str, source_message_id: str, content: str, msg_seq: int,
+    progress: bool = False, origin: str = "conversation",
+    fallback_member_openid: str = "", quote_source: bool = False,
+) -> BotSentGroupMessage: ...
+```
+
+### Contracts
+
+- Invoke after input/audit/reference checks and successful image admission,
+  immediately before the provider call, inside the admission cleanup boundary.
+  Prompt-options generation, style settings, plain chat and web image search do
+  not emit this event. Do not add image calls, retries or quota charges.
+- The originating group receives one persistent notice per admitted request.
+  It is not recalled as temporary progress, and hitting the temporary-progress
+  cap must not suppress it. Panel image options follow the same command path.
+- Start notices explicitly opt into `quote_source=True`. With a nonempty source,
+  the text sender includes `message_reference={"message_id": source_message_id,
+  "ignore_get_message_error": True}` along with passive `msg_id`/`msg_seq`.
+  `msg_id` alone authorizes a passive reply; it does not request the visible
+  original-message quote. Preserve the reference in successful stored payloads
+  and existing expired-msgid fallback; if the original cannot be retrieved, the
+  notice remains deliverable. Other text calls default to no explicit quote.
+- Notice delivery failure logs only fixed event and exception type and does not
+  prevent generation. Cancellation propagates and releases image admission.
+- Reserve reply sequence numbers before awaiting sends, including ambiguous
+  failed sends. Commands use the next sequence for final output. Conversation
+  progress, image-start and deferred notices share the same sequence owner.
+- Serialize image-start with deferred setup/fallback sends to preserve actual
+  send ordering across awaited storage/transport calls. Deferred completion and
+  no-link completion read the current sequence after the workflow completes;
+  never capture a stale final sequence before a late image-start notice.
+- Use existing original-member context for expired passive-message fallback.
+  Final image messages retain their image-only content contract.
+
+### Validation and error matrix
+
+| Condition | Behavior |
+| --- | --- |
+| Admitted explicit GPT/NovelAI or chat GPT generate/edit | Notice awaited before provider call; final output uses later sequences |
+| Empty input, failed audit/reference, denied quota | No start notice and no generation |
+| Notice fails | Consume reserved sequence; continue once; safe diagnostic only |
+| Notice cancelled | Propagate cancellation, release admission, no subsequent generation |
+| Ordinary progress exhausted / conversation deferred | Start notice still sent to group, final sequence resolved dynamically |
+| Deferred setup fails | Consume reservation, allocate a fresh fallback-notice sequence, preserve final delivery |
+
+### Good / base / bad cases
+
+- Good: explicit request sends notice at sequence 1, final text at 2 and image
+  at 3; all belong to the original user message and group.
+- Base: failed notice still allows generation, with final text starting at 2.
+- Bad: route the start notice through temporary progress that is already capped,
+  or reuse a deferred final sequence after a later notice consumed it.
+
+### Required tests
+
+- Actual workflow/provider boundary ordering for both explicit providers and
+  conversational generation/edit; failed validation/admission and non-image paths.
+- Notice failure and cancellation, admission release, deduplication and one-shot
+  notice behavior; final text/image sequence numbers through actual presenter.
+- Capture the installed `BotAPI` HTTP payload to verify the original message
+  reference on start notices, its persistence and retention after both observed
+  expiry errors. Unrelated text/Markdown/image paths retain their old payloads.
+- Exhausted progress, delayed generation after deferral, failed deferred setup,
+  and a late image-start during a blocked pending-page creation. Mock QQ/provider
+  transport; do not send synthetic group messages or generate paid test images.
+
+### Wrong vs correct
+
+Wrong: announce drawing before audit/quota rejection, or let a failed status
+message abort an otherwise admitted image request.
+
+Correct: publish one application-owned event at the admitted provider boundary,
+with a persistent QQ notice and shared reply sequencing.
+
+Wrong: infer visible quoting from a successful passive reply or from a stored
+`source_message_id` alone. Correct: opt in to the explicit `message_reference`
+field and verify it survives installed SDK serialization.
+
 ## Scope / Trigger
 
 Read this when changing `src/aiqq/services/images/codex_responses.py`, shared helpers in `gpt.py`, the image-only SDK mode, image configuration/bootstrap, GPT image workflow errors, or image request tests. The packaged implementation is authoritative; root-level legacy modules are reference material only.
@@ -28,7 +137,7 @@ The common exception lives in `aiqq.exceptions`. `GPTImageError` specializes it 
 - `OPENAI_IMAGE_DRIVER_MODEL` defaults to `gpt-6-astra`, independently of the chat model. `OPENAI_IMAGE_MODEL` defaults to `gpt-image-2` and selects the hosted tool model. Current provider tests show `gpt-5.6-sol` routes through Responses Lite, which rejects `image_generation`; this is a provider-specific observation, not a universal model claim.
 - Ordinary-chat `image_action` owns optional custom `width` and `height`. Both fields are required-nullable in structured output: `null/null` means the deterministic 1024x1024 target; integers must be paired, each be within 256..2048, and total at most 4,194,304 pixels. Missing, partial, non-integer or out-of-range values are invalid agent output. Historical `ImageAction` construction without dimensions remains compatible with the square default.
 - The provider still accepts only `1024x1024`, `1024x1536`, or `1536x1024`. Select the native request size with the nearest symmetric aspect-ratio distance, then normalize locally to the exact custom target. Do not send arbitrary dimensions or provider `auto`. The explicit `/GPT生图` workflow has no skill dimension fields and remains 1024x1024. Image audit orientation remains for NovelAI and does not overwrite GPT action dimensions.
-- Tool defaults remain `quality="medium"`, `output_format="jpeg"`, compression 85. Editing retains `input_fidelity="high"`. Do not pass Images API fields such as `n` or `response_format` to the tool.
+- Tool defaults remain `quality="high"`, `output_format="jpeg"`, compression 85. Editing retains `input_fidelity="high"`. Do not pass Images API fields such as `n` or `response_format` to the tool.
 - Require `response.completed` and a completed `image_generation_call.result`; validate its Base64 and actual image, then normalize to an RGB JPEG whose dimensions match the resolved target canvas, which can differ from the native request size. HTTP 200, an image-start event or text alone is not success. Parse SSE with bounded storage and correct fragmented UTF-8/event handling.
 - `OPENAI_IMAGE_API_KEY` and `OPENAI_IMAGE_BASE_URL` fall back independently to chat configuration. Verify the effective pair and model when diagnosing the provider; do not log the configuration object or credentials.
 - The adapter retries only HTTP 502, at most twice after delays of 0.5 and 1 second, for at most three generation/edit POSTs per business attempt. Each retry reuses the same model, prompt and reference bytes. All other HTTP statuses, timeouts, connection errors and invalid image responses stop without retry.
@@ -161,6 +270,61 @@ Feed both recorded QQ HTTP400 payload variants through the installed SDK error p
 ### Wrong vs correct
 
 Wrong: `str(exc) == "msgid已经过期,不能回复"` as the only known expiry branch. Correct: exact membership in both observed SDK messages, inside the existing `except ServerError` and opt-in guards. Broad matching such as `"过期" in str(exc)` is still incorrect: an unrelated rejection or ambiguous outcome must not trigger another send.
+
+## QQ Image Content Rejection Copy
+
+### Scope and signature
+
+Applies to `services/qq/sender.py` image delivery and the shared foreground /
+deferred presenter in `interfaces/qq/reply.py`. The shared application exception
+is `aiqq.exceptions.ImageContentRejected(AiQQError)`; it carries a fixed safe
+message, not provider response text. Public sender signatures remain unchanged.
+
+### Contract
+
+- The installed botpy SDK drops numeric codes. QQ response 40034006 is observed
+  as exact `ServerError("消息内容违规")`. In `_deliver`, translate that exact
+  exception only for `operation="upload_image"` or `operation="send_message"`
+  with `msg_type=7`, after the existing failed-attempt record is written.
+- The presenter catches `ImageContentRejected` for image delivery and uses
+  `QQ 返回“消息内容违规”，图片未能发送。请调整画面内容后重试。`.
+  Attribute the classification to QQ; do not assert which depicted element was
+  responsible, that generation failed, or that every image was AI-generated.
+- Unknown send failures and local preparation failures keep the generic text.
+  No additional send/upload/generation retry, billing or quota change. Existing
+  expiry recovery, image-only payloads, original source/member association and
+  cancellation propagation remain in force. Do not expose raw exception text.
+
+### Validation and error matrix
+
+| Condition | Behavior |
+| --- | --- |
+| Exact SDK content rejection on image upload/send | Shared rejection exception; fixed QQ-specific notice |
+| Content rejection on the existing proactive image fallback | Same notice; no further fallback/upload |
+| Text/Markdown rejection, other exception class or changed error message | Preserve existing exception behavior |
+| Unknown image error or preparation failure | Existing generic image failure notice |
+| Cancellation | Propagate; no notice or additional call |
+
+### Cases
+
+Good: generated image uploads successfully, QQ rejects sending it with 40034006,
+and the user sees QQ's reason. Base: unknown transport failure still gets a safe
+generic notice. Bad: classify all ServerError exceptions as content rejection.
+
+### Required tests
+
+Feed the observed response through the installed SDK parser, sender and
+presenter. Cover upload/send boundaries, foreground/deferred, rejection after
+expiry fallback, strict type/message/image-only matching, unknown failure and
+cancellation. Check actual request counts, final notice and source association,
+no false successful image record, and unchanged quoting/expiry regressions.
+Use mocked transport only; do not replay real failed requests.
+
+### Wrong vs correct
+
+Wrong: inspect arbitrary error text in the presenter or label every delivery
+failure as a generation/upload error. Correct: classify the known rejection at
+the QQ boundary and preserve it as a shared exception to the fixed user copy.
 
 ## Reference Image Failure Messages
 

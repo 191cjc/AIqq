@@ -37,7 +37,7 @@ from aiqq.services.images.validation import MAX_IMAGE_BYTES
 
 
 logger = logging.getLogger(__name__)
-IMAGE_QUALITY = "medium"
+IMAGE_QUALITY = "high"
 OUTPUT_COMPRESSION = 85
 BAD_GATEWAY_RETRY_DELAYS = (0.5, 1.0)
 INPUT_EXTENSIONS = {

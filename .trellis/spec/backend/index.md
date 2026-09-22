@@ -20,6 +20,8 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [GPT Image Service](./image-services.md) | Image API parameters, failure contracts, retries and verification | Documented |
+| [NovelAI User Style](./novelai-style.md) | Per-sender persistent styles, command semantics and final prompt composition | Documented |
+| [NovelAI Tag Lookup](./novelai-tags.md) | Required Danbooru retrieval before authoring scene prompt options | Documented |
 | [Complete Chat and Vision](./chat-read.md) | Full records, durable events/versions, scoped history/image tools and isolation | Documented |
 
 ---

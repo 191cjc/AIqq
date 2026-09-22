@@ -10,6 +10,7 @@ from aiqq.database import (
     GroupMessageRepository,
     ImageUsageRepository,
     NovelAIPromptSessionRepository,
+    NovelAIStyleRepository,
     SQLiteConnection,
 )
 from aiqq.interfaces.qq.client import AiQQClient, ClientComponents
@@ -27,7 +28,12 @@ from aiqq.interfaces.web import (
 from aiqq.logic.conversation import ConversationWorkflow
 from aiqq.logic.image_quota import ImageQuotaManager
 from aiqq.logic.image_generation import GPTImageWorkflow
-from aiqq.logic.novelai import NovelAIImageWorkflow, NovelAIPromptWorkflow
+from aiqq.logic.novelai import (
+    NovelAIImageWorkflow,
+    NovelAIPromptWorkflow,
+    NovelAIQuickImageWorkflow,
+)
+from aiqq.logic.novelai_style import NovelAIStyleWorkflow
 from aiqq.services.agents import (
     ChatAgent,
     ImagePromptAuditAgent,
@@ -43,6 +49,7 @@ from aiqq.services.images import (
     WebImageService,
 )
 from aiqq.services.images.codex_responses import CodexResponsesImageService
+from aiqq.services.novelai_tags import NovelAITagSearchService
 from aiqq.services.qq import PanelService, QQMessageSender
 from aiqq.services.storage import TemporaryMediaStore, TemporaryReplyStore
 
@@ -63,6 +70,7 @@ def build_application(config: AppConfig) -> Application:
     state_connection = SQLiteConnection(config.storage.state_database_path)
     image_usage_repository = ImageUsageRepository(state_connection)
     prompt_sessions = NovelAIPromptSessionRepository(state_connection)
+    novelai_styles = NovelAIStyleRepository(state_connection)
     image_usage = ImageQuotaManager(
         image_usage_repository,
         daily_limit=config.images.user_daily_limit,
@@ -70,7 +78,6 @@ def build_application(config: AppConfig) -> Application:
     backend = _build_ai_backend(config)
     prompt_auditor = PromptAuditAgent(backend)
     image_auditor = ImagePromptAuditAgent(backend)
-    novelai_prompt_agent = NovelAIPromptAgent(backend)
     gpt_images = CodexResponsesImageService(
         api_key=config.images.api_key,
         base_url=config.images.base_url,
@@ -99,6 +106,9 @@ def build_application(config: AppConfig) -> Application:
     novelai_images = NovelAIService(
         novelai_client,
         max_concurrent=config.images.novelai_max_concurrent,
+    )
+    novelai_prompt_agent = NovelAIPromptAgent(
+        backend, tag_search=NovelAITagSearchService(novelai_client)
     )
     web_images = WebImageService(
         timeout_seconds=config.images.web_download_timeout_seconds
@@ -138,11 +148,17 @@ def build_application(config: AppConfig) -> Application:
         prompt_auditor=image_auditor,
         image_service=novelai_images,
         image_usage=image_usage,
+        styles=novelai_styles,
     )
+    novelai_style_workflow = NovelAIStyleWorkflow(styles=novelai_styles)
     novelai_prompt_workflow = NovelAIPromptWorkflow(
         prompt_auditor=image_auditor,
         prompt_agent=novelai_prompt_agent,
         sessions=prompt_sessions,
+    )
+    novelai_quick_image_workflow = NovelAIQuickImageWorkflow(
+        prompt_workflow=novelai_prompt_workflow,
+        image_workflow=novelai_image_workflow,
     )
     media_store = TemporaryMediaStore(
         config.storage.media_dir,
@@ -171,7 +187,9 @@ def build_application(config: AppConfig) -> Application:
             reply_sender=reply_sender,
             gpt_image_workflow=gpt_image_workflow,
             novelai_image_workflow=novelai_image_workflow,
+            novelai_quick_image_workflow=novelai_quick_image_workflow,
             novelai_prompt_workflow=novelai_prompt_workflow,
+            novelai_style_workflow=novelai_style_workflow,
         )
         message_handler = GroupMessageHandler(
             workflow=conversation,
@@ -221,6 +239,7 @@ def build_application(config: AppConfig) -> Application:
                 group_messages.initialize,
                 image_usage_repository.initialize,
                 prompt_sessions.initialize,
+                novelai_styles.initialize,
                 novelai_images.initialize,
                 media_store.initialize,
                 reply_store.initialize,

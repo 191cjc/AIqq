@@ -9,6 +9,7 @@ from .commands import (
     NOVELAI_IMAGE_COMMAND,
     NOVELAI_PROMPT_COMMAND,
     NOVELAI_PROMPT_EDIT_COMMAND,
+    NOVELAI_STYLE_COMMAND,
 )
 
 
@@ -39,6 +40,11 @@ def feature_menu_keyboard() -> dict[str, Any]:
                     button_id="novelai_image",
                     label=NOVELAI_IMAGE_COMMAND,
                     command=NOVELAI_IMAGE_COMMAND,
+                ),
+                _command_row(
+                    button_id="novelai_style",
+                    label=NOVELAI_STYLE_COMMAND,
+                    command=NOVELAI_STYLE_COMMAND,
                 ),
             ]
         }

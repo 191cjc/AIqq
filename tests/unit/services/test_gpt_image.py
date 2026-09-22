@@ -105,7 +105,7 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0].url.path, "/v1/images/generations")
         self.assertEqual(json.loads(requests[0].content), {
             "model": "gpt-image-2", "prompt": SAFE_IMAGE_INSTRUCTION + PROMPT,
-            "n": 1, "size": "1024x1024", "quality": "medium",
+            "n": 1, "size": "1024x1024", "quality": "high",
             "output_format": "jpeg", "output_compression": 85, "moderation": "auto",
         })
         self.assertEqual(asset.mime_type, "image/jpeg")
@@ -137,7 +137,7 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("response_format", parts)
         expected = {
             "model": "gpt-image-2", "prompt": SAFE_IMAGE_INSTRUCTION + PROMPT,
-            "n": "1", "size": "1024x1024", "quality": "medium",
+            "n": "1", "size": "1024x1024", "quality": "high",
             "output_format": "jpeg", "output_compression": "85",
             "input_fidelity": "high",
         }

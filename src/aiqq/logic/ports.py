@@ -11,6 +11,7 @@ from .models import (
     BotSentGroupMessage,
     ChatAgentOutput,
     ConversationRequest,
+    DanbooruTag,
     GroupReplyContext,
     GroupHistoryMessage,
     ImageAction,
@@ -23,6 +24,7 @@ from .models import (
 )
 
 ProgressCallback = Callable[[str], Awaitable[None]]
+ImageStartCallback = Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,20 @@ class NovelAIImageGenerator(Protocol):
     ) -> ImageAsset: ...
 
 
+class NovelAIStyleStore(Protocol):
+    async def load(self, member_openid: str) -> str | None: ...
+
+    async def save(self, member_openid: str, prompt: str) -> None:
+        """Replace the sender's style; an empty prompt clears it."""
+        ...
+
+
+class NovelAITagSearcher(Protocol):
+    async def search(
+        self, query: str, *, limit: int = 8
+    ) -> tuple[DanbooruTag, ...]: ...
+
+
 class NovelAIPromptGenerator(Protocol):
     async def generate(self, description: str) -> NovelAIPromptOptions: ...
 
@@ -202,6 +218,7 @@ class GroupMessageSender(Protocol):
         progress: bool = False,
         origin: str = "conversation",
         fallback_member_openid: str = "",
+        quote_source: bool = False,
     ) -> BotSentGroupMessage: ...
 
     async def send_markdown_reply(

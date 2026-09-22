@@ -13,13 +13,14 @@ from aiqq.exceptions import (
     ReferenceImageUnavailable,
 )
 
-from .image_generation import _quota_denied, image_failure_result
+from .image_generation import _quota_denied, image_failure_result, notify_image_start
 from .models import ConversationRequest, ConversationResult, ImageAction, ImageAsset
 from .ports import (
     ConversationAgent,
     GeneratedImageService,
     GroupHistoryRepository,
     ImagePromptAuditor,
+    ImageStartCallback,
     ImageUsageLimiter,
     ProgressCallback,
     PromptAuditor,
@@ -87,6 +88,7 @@ class ConversationWorkflow:
         conversation_key: str,
         user_input: str,
         on_progress: ProgressCallback | None = None,
+        on_image_start: ImageStartCallback | None = None,
         request_id: str | None = None,
     ) -> ConversationResult:
         current_request_id = request_id or secrets.token_hex(12)
@@ -180,7 +182,8 @@ class ConversationWorkflow:
         if not images and output.image_action is not None:
             try:
                 image = await self._execute_image_action(
-                    group_id, conversation_key, output.image_action
+                    group_id, conversation_key, output.image_action,
+                    on_image_start=on_image_start,
                 )
             except _ImageQuotaDenied as exc:
                 return _quota_denied(exc.decision)
@@ -255,7 +258,8 @@ class ConversationWorkflow:
         )
 
     async def _execute_image_action(
-        self, group_id: str, conversation_key: str, action: ImageAction
+        self, group_id: str, conversation_key: str, action: ImageAction,
+        *, on_image_start: ImageStartCallback | None = None,
     ) -> ImageAsset:
         if self._image_service is None:
             raise RuntimeError("generated image service is not configured")
@@ -277,6 +281,7 @@ class ConversationWorkflow:
         if not decision.allowed:
             raise _ImageQuotaDenied(decision)
         try:
+            await notify_image_start(on_image_start)
             image = await self._image_service.generate(
                 action, reference_image=reference
             )

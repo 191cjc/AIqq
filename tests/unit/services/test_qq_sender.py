@@ -9,6 +9,8 @@ from botpy.api import BotAPI
 from botpy.errors import ServerError
 from botpy.http import _handle_response
 
+from aiqq.exceptions import ImageContentRejected
+from aiqq.interfaces.qq.reply import ConversationReplySender, IMAGE_START_NOTICE_TEXT
 from aiqq.logic.models import BotSentGroupMessage
 from aiqq.services.qq.sender import QQMessageSender
 
@@ -89,7 +91,7 @@ class ExpiredReplyHttp:
             self.uploads.append(kwargs["json"])
             return {"file_info": "uploaded-file"}
         self.payloads.append(kwargs["json"])
-        if len(self.payloads) == 1:
+        if self.code is not None and len(self.payloads) == 1:
             return await _handle_response(SimpleNamespace(
                 status=400,
                 request_info=SimpleNamespace(url=route.url),
@@ -104,6 +106,156 @@ class ExpiredReplyHttp:
 
 
 class QQMessageSenderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_image_content_rejection_is_typed_after_failed_attempt_recording(self):
+        for stage in ("upload", "send"):
+            with self.subTest(stage=stage):
+                error = ServerError("消息内容违规")
+                api = FakeApi([error] if stage == "send" else [])
+                if stage == "upload":
+                    api.post_group_file = AsyncMock(side_effect=error)
+                repository = FakeRepository()
+                sender = QQMessageSender(api, repository, bot_username="AiQQ")
+
+                with self.assertRaises(ImageContentRejected) as caught:
+                    await sender.send_image_reply(
+                        group_id="group", source_message_id="source", msg_seq=2,
+                        public_url="https://example/image.jpg", mime_type="image/jpeg",
+                        fallback_member_openid="member",
+                    )
+
+                self.assertIs(caught.exception.__cause__, error)
+                self.assertEqual(str(caught.exception), "QQ rejected image content")
+                self.assertEqual(repository.attempts[-1]["status"], "failed")
+                self.assertEqual(repository.attempts[-1]["error_type"], "ServerError")
+                self.assertEqual(repository.saved, [])
+                self.assertEqual(len(api.sent), 0 if stage == "upload" else 1)
+                if stage == "upload":
+                    api.post_group_file.assert_awaited_once()
+                else:
+                    self.assertEqual(len(api.uploads), 1)
+
+    async def test_image_rejection_requires_exact_sdk_error_and_never_swallows_cancel(self):
+        errors = (
+            ServerError(" 消息内容违规"),
+            ServerError("消息内容违规 "),
+            ServerError("消息内容违规; details"),
+            ServerError("remote unavailable"),
+            RuntimeError("消息内容违规"),
+            TimeoutError("消息内容违规"),
+            asyncio.CancelledError(),
+        )
+        for stage, error in product(("upload", "send"), errors):
+            with self.subTest(stage=stage, error=repr(error)):
+                api = FakeApi([error] if stage == "send" else [])
+                if stage == "upload":
+                    api.post_group_file = AsyncMock(side_effect=error)
+                repository = FakeRepository()
+                sender = QQMessageSender(api, repository, bot_username="AiQQ")
+
+                with self.assertRaises(type(error)) as caught:
+                    await sender.send_image_reply(
+                        group_id="group", source_message_id="source", msg_seq=2,
+                        public_url="https://example/image.jpg", mime_type="image/jpeg",
+                        fallback_member_openid="member",
+                    )
+
+                self.assertIs(caught.exception, error)
+                self.assertEqual(repository.saved, [])
+                self.assertEqual(len(api.sent), 0 if stage == "upload" else 1)
+                self.assertEqual(repository.attempts[-1]["status"],
+                                 "cancelled" if isinstance(error, asyncio.CancelledError) else "failed")
+                if stage == "upload":
+                    api.post_group_file.assert_awaited_once()
+                else:
+                    self.assertEqual(len(api.uploads), 1)
+
+    async def test_text_content_rejection_is_not_an_image_failure(self):
+        for kind in ("text", "markdown", "proactive"):
+            with self.subTest(kind=kind):
+                error = ServerError("消息内容违规")
+                api = FakeApi([error])
+                repository = FakeRepository()
+                sender = QQMessageSender(api, repository, bot_username="AiQQ")
+                context = dict(group_id="group", content="answer")
+                if kind != "proactive":
+                    context.update(source_message_id="source", msg_seq=2,
+                                   fallback_member_openid="member")
+                call = {
+                    "text": sender.send_text_reply,
+                    "markdown": sender.send_markdown_reply,
+                    "proactive": sender.send_proactive_text,
+                }[kind]
+
+                with self.assertRaises(ServerError) as caught:
+                    await call(**context)
+
+                self.assertIs(caught.exception, error)
+                self.assertEqual(len(api.sent), 1)
+                self.assertEqual(api.uploads, [])
+                self.assertEqual(repository.saved, [])
+
+    async def test_image_start_quotes_original_through_real_sdk_and_expired_fallback(self):
+        reference = {"message_id": "original-message", "ignore_get_message_error": True}
+        for code, message in ((None, None), *EXPIRED_REPLY_ERRORS):
+            with self.subTest(code=code):
+                http = ExpiredReplyHttp(code, message)
+                repository = FakeRepository()
+                sender = QQMessageSender(BotAPI(http), repository, bot_username="AiQQ")
+                presenter = ConversationReplySender(
+                    sender=sender, reply_store=AsyncMock(), media_store=AsyncMock()
+                )
+
+                await presenter.send_image_start(
+                    group_id="group", source_message_id="original-message",
+                    member_openid="member", msg_seq=3,
+                )
+
+                self.assertEqual(len(http.payloads), 1 if code is None else 2)
+                for payload in http.payloads:
+                    self.assertEqual(payload["message_reference"], reference)
+                    self.assertEqual(payload["group_openid"], "group")
+                    self.assertEqual(payload["msg_type"], 0)
+                original = http.payloads[0]
+                self.assertEqual(original["msg_id"], "original-message")
+                self.assertEqual(original["msg_seq"], 3)
+                self.assertEqual(original["content"], IMAGE_START_NOTICE_TEXT)
+                if code is not None:
+                    fallback = http.payloads[1]
+                    self.assertIsNone(fallback["msg_id"])
+                    self.assertIsNone(fallback["msg_seq"])
+                    self.assertEqual(fallback["content"], "<@member> " + IMAGE_START_NOTICE_TEXT)
+                self.assertEqual(len(repository.saved), 1)
+                saved = repository.saved[0]
+                self.assertEqual(saved["payload"]["message_reference"], reference)
+                self.assertEqual(saved["source_message_id"], "original-message")
+                self.assertFalse(saved["progress"])
+                self.assertEqual(saved["content"], IMAGE_START_NOTICE_TEXT)
+                self.assertEqual(
+                    saved["payload"]["delivery_mode"], "reply" if code is None else "proactive"
+                )
+                for attempt in repository.attempts:
+                    self.assertEqual(attempt["parameters"]["request"]["message_reference"], reference)
+
+    async def test_real_sdk_text_reference_is_opt_in_and_requires_source(self):
+        for source_message_id, options in (
+            ("source", {}),
+            ("source", {"quote_source": False}),
+            ("", {"quote_source": True}),
+        ):
+            with self.subTest(source_message_id=source_message_id, options=options):
+                http = ExpiredReplyHttp(None, None)
+                repository = FakeRepository()
+                sender = QQMessageSender(BotAPI(http), repository, bot_username="AiQQ")
+
+                await sender.send_text_reply(
+                    group_id="group", source_message_id=source_message_id,
+                    content="ordinary text", msg_seq=1, **options,
+                )
+
+                self.assertEqual(len(http.payloads), 1)
+                self.assertIsNone(http.payloads[0]["message_reference"])
+                self.assertNotIn("message_reference", repository.saved[0]["payload"])
+
     async def test_delivery_attempts_preserve_rejections_and_success_without_false_messages(self):
         repository = FakeRepository()
         api = FakeApi([ServerError("msgid已经过期,不能回复"), {"id": "actual", "extra_result": False}])
@@ -162,6 +314,8 @@ class QQMessageSenderTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(target.message_id, "proactive-1")
                 self.assertEqual(len(http.payloads), 2)
                 original, fallback = http.payloads
+                self.assertIsNone(original["message_reference"])
+                self.assertIsNone(fallback["message_reference"])
                 self.assertEqual(original["msg_id"], "expired-source")
                 self.assertEqual(original["msg_seq"], 4)
                 self.assertIsNone(fallback["msg_id"])

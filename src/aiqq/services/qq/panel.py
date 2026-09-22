@@ -12,6 +12,8 @@ from aiqq.interfaces.qq.commands import (
     MENU_COMMAND,
     NOVELAI_IMAGE_COMMAND,
     NOVELAI_PROMPT_COMMAND,
+    NOVELAI_QUICK_IMAGE_COMMAND,
+    NOVELAI_STYLE_COMMAND,
 )
 
 
@@ -21,7 +23,9 @@ LEGACY_CLEAR_MEMORY_COMMAND = "清除记忆"
 MANAGED_COMMANDS = {
     MENU_COMMAND,
     NOVELAI_PROMPT_COMMAND,
+    NOVELAI_QUICK_IMAGE_COMMAND,
     NOVELAI_IMAGE_COMMAND,
+    NOVELAI_STYLE_COMMAND,
     GPT_IMAGE_COMMAND,
     LEGACY_CLEAR_MEMORY_COMMAND,
 }
@@ -37,7 +41,9 @@ def command_items() -> list[dict[str, Any]]:
     return [
         _item(MENU_COMMAND, "打开机器人快捷功能菜单"),
         _item(NOVELAI_PROMPT_COMMAND, "将画面描述转换为生图提示词"),
+        _item(NOVELAI_QUICK_IMAGE_COMMAND, "生成提示词后直接开始作画"),
         _item(NOVELAI_IMAGE_COMMAND, "输入提示词生成图片"),
+        _item(NOVELAI_STYLE_COMMAND, "设置个人画风，留空发送可清除"),
     ]
 
 

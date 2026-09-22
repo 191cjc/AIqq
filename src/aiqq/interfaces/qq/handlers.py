@@ -29,6 +29,8 @@ DEFERRED_LINK_UNAVAILABLE_TEXT = "任务处理时间过长，但进展页面暂�
 
 @dataclass(frozen=True)
 class IncomingGroupMessage:
+    """Business input with the leading bot mention already removed at ingress."""
+
     group_id: str
     message_id: str
     member_openid: str
@@ -97,7 +99,7 @@ class GroupMessageHandler:
     async def handle(self, message: IncomingGroupMessage) -> bool:
         if not await self._claim(message.group_id, message.message_id):
             return False
-        prompt = clean_prompt(message.content)
+        prompt = message.content.strip()
         if not prompt and message.has_attachments:
             prompt = "请查看我这条消息中的图片或表情，并描述内容。"
         if not prompt:
@@ -138,6 +140,22 @@ class GroupMessageHandler:
             source_message_id=message.message_id,
         )
         progress = _ProgressRouter(reporter)
+        notice_lock = asyncio.Lock()
+        image_started = False
+
+        async def on_image_start() -> None:
+            nonlocal image_started
+            async with notice_lock:
+                if image_started:
+                    return
+                image_started = True
+                await self._reply_sender.send_image_start(
+                    group_id=message.group_id,
+                    source_message_id=message.message_id,
+                    member_openid=message.member_openid,
+                    msg_seq=reporter.reserve_msg_seq(),
+                )
+
         workflow_task = asyncio.create_task(
             self._workflow.run(
                 group_id=message.group_id,
@@ -147,6 +165,7 @@ class GroupMessageHandler:
                 ),
                 user_input=prompt,
                 on_progress=progress.publish,
+                on_image_start=on_image_start,
             ),
             name=f"aiqq-conversation-{message.message_id}",
         )
@@ -161,48 +180,56 @@ class GroupMessageHandler:
             raise
 
         if not done:
-            await reporter.finish()
             try:
-                deferred = await self._reply_sender.start_deferred(
-                    group_id=message.group_id,
-                    source_message_id=message.message_id,
-                    member_openid=message.member_openid,
-                    first_msg_seq=reporter.next_msg_seq,
-                )
-                await progress.defer_to(deferred)
-            except Exception as exc:
-                logger.warning(
-                    "event=deferred_reply_start_failed error_type=%s",
-                    type(exc).__name__,
-                )
+                await reporter.finish()
+                async with notice_lock:
+                    try:
+                        deferred = await self._reply_sender.start_deferred(
+                            group_id=message.group_id,
+                            source_message_id=message.message_id,
+                            member_openid=message.member_openid,
+                            first_msg_seq=reporter.reserve_msg_seq(),
+                            next_msg_seq=lambda: reporter.next_msg_seq,
+                        )
+                        await progress.defer_to(deferred)
+                    except Exception as exc:
+                        logger.warning(
+                            "event=deferred_reply_start_failed error_type=%s",
+                            type(exc).__name__,
+                        )
+                        try:
+                            await self._sender.send_text_reply(
+                                group_id=message.group_id,
+                                source_message_id=message.message_id,
+                                content=DEFERRED_LINK_UNAVAILABLE_TEXT,
+                                msg_seq=reporter.reserve_msg_seq(),
+                                fallback_member_openid=message.member_openid,
+                            )
+                        except Exception as notice_exc:
+                            logger.warning(
+                                "event=deferred_reply_notice_failed error_type=%s",
+                                type(notice_exc).__name__,
+                            )
+                        self._track_deferred(
+                            self._complete_without_deferred(
+                                workflow_task,
+                                message,
+                                next_msg_seq=lambda: reporter.next_msg_seq,
+                            )
+                        )
+                        return True
                 self._track_deferred(
-                    self._complete_without_deferred(
-                        workflow_task,
-                        message,
-                        first_msg_seq=reporter.next_msg_seq + 1,
-                    )
+                    self._complete_deferred(workflow_task, deferred)
                 )
-                try:
-                    await self._sender.send_text_reply(
-                        group_id=message.group_id,
-                        source_message_id=message.message_id,
-                        content=DEFERRED_LINK_UNAVAILABLE_TEXT,
-                        msg_seq=reporter.next_msg_seq,
-                        fallback_member_openid=message.member_openid,
-                    )
-                except Exception as notice_exc:
-                    logger.warning(
-                        "event=deferred_reply_notice_failed error_type=%s",
-                        type(notice_exc).__name__,
-                    )
+                logger.info(
+                    "event=group_conversation_deferred message_id=%s", message.message_id
+                )
                 return True
-            self._track_deferred(
-                self._complete_deferred(workflow_task, deferred)
-            )
-            logger.info(
-                "event=group_conversation_deferred message_id=%s", message.message_id
-            )
-            return True
+            except asyncio.CancelledError:
+                workflow_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await workflow_task
+                raise
 
         try:
             result = workflow_task.result()
@@ -271,7 +298,7 @@ class GroupMessageHandler:
         workflow_task: asyncio.Task[ConversationResult],
         message: IncomingGroupMessage,
         *,
-        first_msg_seq: int,
+        next_msg_seq: Callable[[], int],
     ) -> None:
         try:
             result = await workflow_task
@@ -293,7 +320,7 @@ class GroupMessageHandler:
                 group_id=message.group_id,
                 source_message_id=message.message_id,
                 member_openid=message.member_openid,
-                first_msg_seq=first_msg_seq,
+                first_msg_seq=next_msg_seq(),
             )
         except Exception as exc:
             logger.warning(
@@ -313,8 +340,32 @@ class GroupMessageHandler:
             return True
 
 
-def clean_prompt(content: str | None) -> str:
-    return BOT_MENTION_RE.sub("", content or "").strip()
+def clean_prompt(
+    content: str | None,
+    *,
+    bot_name: str = DEFAULT_BOT_NAME,
+    mentions: object = None,
+) -> str:
+    """Remove at most one leading bot mention, preserving the remaining body."""
+    text = (content or "").strip()
+    native_mention = BOT_MENTION_RE.match(text)
+    if native_mention is not None:
+        return text[native_mention.end() :].lstrip()
+
+    names = []
+    if isinstance(mentions, list):
+        for mention in mentions:
+            if not isinstance(mention, dict) or mention.get("is_you") is not True:
+                continue
+            username = mention.get("username")
+            if isinstance(username, str):
+                names.append(username)
+    names.append(bot_name)
+    for name in names:
+        prefix = _text_bot_mention_prefix(text, name)
+        if prefix:
+            return text[len(prefix) :].lstrip()
+    return text
 
 
 def raw_event_mentions_bot(
@@ -330,8 +381,8 @@ def raw_event_mentions_bot(
     ):
         return True
     content = data.get("content")
-    return isinstance(content, str) and _starts_with_text_bot_mention(
-        content, bot_name
+    return isinstance(content, str) and bool(
+        _text_bot_mention_prefix(content.lstrip(), bot_name)
     )
 
 
@@ -342,25 +393,18 @@ def normalized_group_message_data(
     if not isinstance(data, dict):
         return None
     normalized = dict(data)
-    content = clean_prompt(str(normalized.get("content") or ""))
-    mentions = normalized.get("mentions")
-    removed_native_mention = False
-    if isinstance(mentions, list):
-        for mention in mentions:
-            if not isinstance(mention, dict) or mention.get("is_you") is not True:
-                continue
-            username = mention.get("username")
-            if isinstance(username, str) and content.startswith(f"@{username}"):
-                content = content[len(username) + 1 :].lstrip()
-                removed_native_mention = True
-                break
-    name = bot_name.strip()
-    if not removed_native_mention and _starts_with_text_bot_mention(content, name):
-        content = content[len(name) + 1 :].lstrip()
-    normalized["content"] = content
+    normalized["content"] = clean_prompt(
+        str(normalized.get("content") or ""),
+        bot_name=bot_name,
+        mentions=normalized.get("mentions"),
+    )
     return normalized
 
 
-def _starts_with_text_bot_mention(content: str, bot_name: str) -> bool:
+def _text_bot_mention_prefix(content: str, bot_name: str) -> str:
     name = bot_name.strip()
-    return bool(name) and content.lstrip().startswith(f"@{name}")
+    if name:
+        for prefix in (f"[@{name}]", f"@{name}"):
+            if content.startswith(prefix):
+                return prefix
+    return ""

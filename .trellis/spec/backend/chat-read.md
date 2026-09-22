@@ -45,12 +45,23 @@ production serialization whitelist. `ConversationRequest` carries `group_id`,
   Recovery applies only local projections, never chat, quota, generation or send.
 - A full-group `GROUP_MESSAGE_CREATE` dispatches when QQ marks a structured
   `mentions[].is_you=true` mention or when content, after leading whitespace,
-  starts with the exact case-sensitive `@<current runtime bot name>`. The runtime
+  starts with the exact case-sensitive `@<current runtime bot name>` or
+  `[@<current runtime bot name>]`. Brackets are a valid QQ-delivered display
+  representation; never describe them as a malformed user mention. The runtime
   name comes from `robot.name` with `AiQQ` only as its empty-name fallback; never
   hard-code a deployed display name. Remove one matching leading mention before
   existing command/conversation routing. Mid-message, partial, old-name and alias
   text remain stored but do not dispatch. Raw/SDK delivery of one message still
   relies on the shared `(group_id, message_id)` handler deduplication.
+- Raw and SDK ingress must share one normalization boundary before command
+  parsing. Recognizing a mention as a trigger also requires removing that same
+  leading representation from the business input. Native metadata can supply a
+  confirmed bot username; SDK `GroupMessage` projections may lose mention
+  `username`/`is_you`, so current runtime-name handling must work independently.
+  Remove only the leading mention once, preserving subsequent mentions and
+  internal whitespace/newlines. Do not mutate saved envelopes, message versions,
+  or history display to fix routing. `IncomingGroupMessage` is the normalized
+  internal input to `GroupMessageHandler`, not a raw QQ payload.
 - Current attachments normally resolve to exact immutable source metadata.
   Directly nested image objects enriched across receipts instead carry explicit
   `metadata_source=current_projection`, `version_id=null` and actual
@@ -113,7 +124,7 @@ production serialization whitelist. `ConversationRequest` carries `group_id`,
 | Per-request limit | Explicit `budget_exhausted`, no silent truncation |
 | Actual model context limit | `AgentContextTooLarge`, clear capacity text, no shortened retry |
 | Projection failure/cancellation | Durable raw event remains recoverable; no business replay |
-| Leading exact text `@<runtime name>` | Persist, strip one prefix, then dispatch through the existing handler |
+| Leading exact `@<runtime name>` or `[@<runtime name>]` | Persist, strip one prefix, then dispatch through the existing handler |
 | Mid-message / partial / stale text name | Persist without business dispatch |
 | Isolation unavailable | Chat unavailable; no unrestricted-shell fallback |
 
@@ -134,6 +145,8 @@ summarization from hiding the original-image expiry reason again.
   survive DB → workflow → chat serialization exactly, including future columns.
 - Good: a leading textual `@<runtime name>` is persisted, normalized once and
   dispatched; a simultaneous native callback is removed by handler deduplication.
+- Good: a valid `[@<runtime name>] /NovelAI生图 ...` routes to the NovelAI command
+  with its complete argument, regardless of raw/SDK callback order.
 - Base: a historical GIF is selected, downloaded on demand, sampled into three
   real visual inputs, then removed at request completion.
 - Bad: matching a hard-coded deployed bot name, triggering on a mid-message name,
@@ -146,7 +159,9 @@ summarization from hiding the original-image expiry reason again.
 Assert complete DB-to-model equality (future columns, deep unknown fields, more
 than 20 attachments, false/null/zero, multiline text); current image-only @,
 runtime-name text @ (leading whitespace, no separator, empty/image-only body,
-partial/old/mid-message rejection), native mentions and raw/SDK dedup; stable
+partial/old/mid-message rejection), native angle-ID and bracketed mentions,
+preserved later mentions, actual SDK projections and both raw-first/SDK-first
+deduplication with command routing asserted; stable
 same-group history/version paging; legacy migration with
 unchanged IDs/all original columns; raw commit + failure/restart recovery; late
 local recall; input animation budgets and cleanup; real SDK offline tool
@@ -211,6 +226,11 @@ Wrong: hard-code the current deployed bot display name or dispatch any message
 that merely contains it. Correct: capture `robot.name` at readiness, require an
 exact leading `@<runtime name>`, preserve the raw event first, normalize once and
 reuse the existing handler and deduplication.
+
+Wrong: authorize dispatch using `mentions[].is_you` but strip only `@name` and
+`<@id>`, allowing a valid `[@name] /NovelAI生图 ...` to fall through to chat/GPT.
+Correct: use the same leading-name matching logic to recognize and normalize
+the bracketed form, and assert the final parsed command across both ingress paths.
 
 Wrong: enable shell/view_image flags while retaining a handler that aborts every
 command event, or claim read-only/workspace-write prevents host file reads.

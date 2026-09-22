@@ -9,14 +9,18 @@ from typing import Literal
 MENU_COMMAND = "菜单"
 GPT_IMAGE_COMMAND = "GPT生图"
 NOVELAI_IMAGE_COMMAND = "NovelAI生图"
+NOVELAI_STYLE_COMMAND = "NovelAI画风"
 NOVELAI_PROMPT_COMMAND = "NovelAI提示词"
+NOVELAI_QUICK_IMAGE_COMMAND = "NovelAI快速生图"
 NOVELAI_PROMPT_EDIT_COMMAND = "修改NovelAI提示词"
 
 CommandName = Literal[
     "menu",
     "gpt_image",
     "novelai_image",
+    "novelai_style",
     "novelai_prompt",
+    "novelai_quick_image",
     "novelai_prompt_edit",
 ]
 
@@ -32,8 +36,10 @@ def parse_command(content: str) -> ParsedCommand | None:
     normalized = content.strip()
     for label, name in (
         (NOVELAI_PROMPT_EDIT_COMMAND, "novelai_prompt_edit"),
+        (NOVELAI_QUICK_IMAGE_COMMAND, "novelai_quick_image"),
         (NOVELAI_PROMPT_COMMAND, "novelai_prompt"),
         (NOVELAI_IMAGE_COMMAND, "novelai_image"),
+        (NOVELAI_STYLE_COMMAND, "novelai_style"),
         (GPT_IMAGE_COMMAND, "gpt_image"),
         (MENU_COMMAND, "menu"),
         ("功能菜单", "menu"),
