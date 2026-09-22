@@ -53,3 +53,26 @@ Added runtime-name textual @ mention dispatch and normalization while preserving
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: NovelAI quick image generation
+<!-- trellis-session: v=2 fp=0c6566e8eff66fa2 -->
+
+**Date**: 2026-09-22
+**Task**: NovelAI quick image generation
+**Branch**: `main`
+
+### Summary
+
+Added the NovelAI快速生图 panel command, shared no-session prompt authoring, fixed first-option generation through the existing style/quota/notice workflow, focused regressions, README/spec updates, and committed the accumulated NovelAI/QQ workflow changes. Full 368-test unit suite passed; no deployment or live generation was performed.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `02dc66d` | feat: expand NovelAI and QQ image workflows |
+| `697215c` | chore: record active task artifacts |
+
+### Status
+
+[OK] **Completed**
