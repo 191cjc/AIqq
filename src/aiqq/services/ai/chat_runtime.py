@@ -42,10 +42,12 @@ HOP_HEADERS = {"host", "content-length", "connection", "transfer-encoding", "te"
 class ChatRuntime:
     def __init__(self, *, session: ChatReadSession, work: Path, runtime: Path,
                  cli: str, api_key: str, base_url: str, model: str,
-                 enable_web_search: bool = False) -> None:
+                 enable_web_search: bool = False,
+                 max_output_tokens: int = 1000) -> None:
         self.session, self.work, self.runtime = session, work, runtime
         self.cli, self.api_key, self.base_url, self.model = cli, api_key, base_url, model
         self.enable_web_search = enable_web_search
+        self.max_output_tokens = max_output_tokens
         self.model_token = secrets.token_urlsafe(32)
         self.read_token = secrets.token_urlsafe(32)
         self.url = ""
@@ -55,9 +57,33 @@ class ChatRuntime:
         self._handlers: set[asyncio.Task] = set()
         self._requests = 0
         self._search_requests = 0
+        self._history_read_requests = 0
+        self._image_read_requests = 0
         self._images: dict[str, Path] = {}
         self._supervisor: tuple[int, str] | None = None
-        self._history_context: list[dict[str, Any]] = []
+        self._pending_history_context: list[dict[str, Any]] = []
+        self._staged_history_pages: set[int] = set()
+        self._history_lock = asyncio.Lock()
+
+    @property
+    def provider_request_count(self) -> int:
+        return self._requests
+
+    @property
+    def tool_request_count(self) -> int:
+        return self._history_read_requests + self._image_read_requests
+
+    @property
+    def history_read_count(self) -> int:
+        return self._history_read_requests
+
+    @property
+    def image_read_count(self) -> int:
+        return self._image_read_requests
+
+    @property
+    def search_request_count(self) -> int:
+        return self._search_requests
 
     async def __aenter__(self) -> "ChatRuntime":
         app = web.Application(client_max_size=64 * 1024 * 1024)
@@ -89,6 +115,9 @@ class ChatRuntime:
             await self._runner.cleanup()
         if self._client is not None:
             await self._client.aclose()
+        async with self._history_lock:
+            self._pending_history_context.clear()
+            self._staged_history_pages.clear()
 
     def stop_children(self) -> None:
         """Kill tool descendants before the SDK kills its CLI process on abort."""
@@ -155,6 +184,7 @@ class ChatRuntime:
             if not isinstance(payload, dict):
                 raise web.HTTPBadRequest()
             if request.path == "/history":
+                self._history_read_requests += 1
                 result = await self.session.read_history(**payload)
                 if result.get("status") != "error":
                     # Native shell output has its own token truncation. Preserve
@@ -165,15 +195,22 @@ class ChatRuntime:
                         result = {"status": "error", "error_kind": "capacity",
                                   "message": "完整历史页超过本轮容量，请缩小查询范围。"}
                     else:
-                        self._history_context.append(json.loads(encoded))
-                        result = {"status": "ok", "full_records_delivery": "model_context",
-                                  "page_number": len(self._history_context),
+                        page_number = result.get("pages_read")
+                        async with self._history_lock:
+                            staged = page_number not in self._staged_history_pages
+                            if staged:
+                                self._staged_history_pages.add(page_number)
+                                self._pending_history_context.append(json.loads(encoded))
+                        result = {"status": "ok", "history_delivery": "model_context",
+                                  "page_number": page_number,
+                                  "new_page_staged": staged,
                                   "message_count": len(result.get("messages", [])),
                                   **{key: result[key] for key in (
                                       "next_cursor", "next_version_cursor", "next_event_cursor",
-                                      "has_more", "has_more_versions", "has_more_events",
+                                      "has_more", "versions_has_more", "events_has_more",
                                       "pages_read", "pages_remaining") if key in result}}
             else:
+                self._image_read_requests += 1
                 if set(payload) - {"record_id", "attachment_index", "version_id"}:
                     raise web.HTTPBadRequest()
                 metadata, images = await self.session.read_image(**payload)
@@ -245,14 +282,26 @@ class ChatRuntime:
             payload = await request.json()
             if not isinstance(payload, dict) or payload.get("model") != self.model:
                 raise web.HTTPBadRequest(text="unexpected model")
-            if self._history_context:
-                inputs = payload.get("input")
-                if not isinstance(inputs, list):
-                    raise web.HTTPBadRequest(text="unexpected model input")
+            configured_limit = self.max_output_tokens
+            requested_limit = payload.get("max_output_tokens")
+            if type(requested_limit) is int and requested_limit > 0:
+                payload["max_output_tokens"] = min(requested_limit, configured_limit)
+            else:
+                payload["max_output_tokens"] = configured_limit
+            async with self._history_lock:
+                pending_history = self._pending_history_context
+                if pending_history:
+                    inputs = payload.get("input")
+                    if not isinstance(inputs, list):
+                        raise web.HTTPBadRequest(text="unexpected model input")
+                    self._pending_history_context = []
+                else:
+                    inputs = None
+            if pending_history:
                 payload["input"] = [*inputs, {"type": "message", "role": "user", "content": [{
                     "type": "input_text", "text": json.dumps({
-                        "untrusted_chat_read_results": self._history_context,
-                        "scope": "complete same-group history pages requested by the read_history tool",
+                        "untrusted_chat_read_results": pending_history,
+                        "scope": "same-group history pages requested by the read_history tool",
                     }, ensure_ascii=False),
                 }]}]
             if any(tool.get("type") == "image_generation" for tool in payload.get("tools", []) if isinstance(tool, dict)):

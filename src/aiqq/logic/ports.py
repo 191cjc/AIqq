@@ -2,7 +2,7 @@
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from .chat_read import ChatReadSession
@@ -25,6 +25,15 @@ from .models import (
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 ImageStartCallback = Callable[[], Awaitable[None]]
+MemberMessageRecallStatus = Literal["recalled", "permission_denied", "expired", "failed"]
+AITurnPurpose = Literal[
+    "audit",
+    "chat",
+    "image_audit",
+    "novelai_plan",
+    "novelai_author",
+    "image_generation",
+]
 
 
 @dataclass(frozen=True)
@@ -39,6 +48,7 @@ class AIBackend(Protocol):
     async def run(
         self,
         *,
+        purpose: AITurnPurpose,
         instructions: str,
         model_input: str,
         output_schema: Mapping[str, Any],
@@ -107,9 +117,15 @@ class ImagePromptAuditor(Protocol):
 
 
 class ImageUsageLimiter(Protocol):
-    async def reserve_attempt(self, conversation_key: str) -> ImageUsageDecision: ...
+    async def reserve_attempt(
+        self, conversation_key: str, *, provider: str = "shared",
+        member_openid: str = "",
+    ) -> ImageUsageDecision: ...
 
-    async def record_success(self, conversation_key: str) -> None: ...
+    async def record_success(
+        self, conversation_key: str, *, provider: str = "shared",
+        member_openid: str = "",
+    ) -> None: ...
 
     async def finish_attempt(self, conversation_key: str) -> None: ...
 
@@ -118,6 +134,13 @@ class ImageUsageStore(Protocol):
     async def success_count(self, conversation_key: str, usage_date: str) -> int: ...
 
     async def increment_success(self, conversation_key: str, usage_date: str) -> None: ...
+
+    async def nai_v5_success_count(self, member_openid: str, usage_date: str) -> int: ...
+
+    async def increment_nai_v5_success(
+        self, conversation_key: str, member_openid: str, usage_date: str,
+        *, count_toward_shared: bool,
+    ) -> None: ...
 
 
 class NovelAIImageGenerator(Protocol):
@@ -191,6 +214,10 @@ class BotMessageRepository(Protocol):
         self, *, group_id: str, message_id: str, recalled_at: str | None = None
     ) -> bool: ...
 
+    async def mark_member_recalled(
+        self, *, group_id: str, message_id: str, recalled_at: str | None = None
+    ) -> bool: ...
+
     async def find_console_reply_context(
         self,
         group_id: str,
@@ -248,3 +275,7 @@ class GroupMessageSender(Protocol):
     ) -> BotSentGroupMessage: ...
 
     async def recall_from_group(self, target: BotSentGroupMessage) -> bool: ...
+
+    async def recall_member_message(
+        self, *, group_id: str, message_id: str
+    ) -> MemberMessageRecallStatus: ...

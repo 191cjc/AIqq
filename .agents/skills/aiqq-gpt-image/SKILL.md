@@ -17,10 +17,12 @@ image itself.
   state. Older protocol entries may use top-level `record_id` and `has_image`.
 - Otherwise set `image_action=null`. Questions about images and requests to find an
   existing web image are not generation requests.
-- Every non-null `image_action` must include `width` and `height`. Use the exact
-  requested dimensions when the user supplies valid integer dimensions. Otherwise,
-  choose dimensions only when the intended composition or use provides a reliable
-  choice; if it does not, set both fields to `null` for the 1024x1024 default.
+- Every non-null `image_action` must include `width` and `height`, both set to `null`.
+  Generation and editing use automatic sizing (`size="auto"`). The application
+  displays the returned image unchanged and does not guarantee requested or
+  reference dimensions. Include user requests about dimensions, aspect ratio, or
+  preserving composition in the prompt. Translation and retouching do not imply
+  a request to crop, add padding, or change composition.
 - `width` and `height` must either both be `null` or both be integers from 256 through
   2048, and their product must not exceed 4194304. Never output `auto`, a dimension
   string, only one dimension, or values outside these limits.

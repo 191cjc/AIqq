@@ -6,7 +6,8 @@ import logging
 
 from aiqq.exceptions import ImageAuditUnavailable, ImageGenerationUnavailable
 
-from .models import ConversationResult, ImageAction, ImageUsageDecision
+from .image_audit import ImageAuditPolicy
+from .models import ConversationResult, ImageAction, ImagePromptAuditResult, ImageUsageDecision
 from .ports import (
     GeneratedImageService,
     ImagePromptAuditor,
@@ -39,13 +40,16 @@ class GPTImageWorkflow:
         prompt_auditor: ImagePromptAuditor,
         image_service: GeneratedImageService,
         image_usage: ImageUsageLimiter,
+        audit_policy: ImageAuditPolicy | None = None,
     ) -> None:
         self._prompt_auditor = prompt_auditor
         self._image_service = image_service
         self._image_usage = image_usage
+        self._audit_policy = audit_policy or ImageAuditPolicy()
 
     async def run(
         self, prompt: str, *, conversation_key: str,
+        member_openid: str = "",
         on_image_start: ImageStartCallback | None = None,
     ) -> ConversationResult:
         normalized = prompt.strip()
@@ -53,16 +57,13 @@ class GPTImageWorkflow:
             return ConversationResult(
                 "rejected", IMAGE_COMMAND_USAGE, IMAGE_COMMAND_USAGE
             )
-        try:
-            audit = await self._prompt_auditor.audit(normalized)
-        except ImageAuditUnavailable:
-            return _unavailable(IMAGE_AUDIT_UNAVAILABLE, "image_audit_unavailable")
-        if not audit.safe or not audit.effective:
-            detail = audit.reason.strip()
-            if audit.suggested_prompt.strip():
-                detail += f"\n\n可改为：{audit.suggested_prompt.strip()}"
-            summary = "图片提示词未通过审核。"
-            return ConversationResult("rejected", detail, summary)
+        if not self._audit_policy.is_exempt(member_openid):
+            try:
+                audit = await self._prompt_auditor.audit(normalized)
+            except ImageAuditUnavailable:
+                return _unavailable(IMAGE_AUDIT_UNAVAILABLE, "image_audit_unavailable")
+            if not audit.safe or not audit.effective:
+                return image_audit_rejection_result(audit)
 
         try:
             decision = await self._image_usage.reserve_attempt(conversation_key)
@@ -101,6 +102,29 @@ class GPTImageWorkflow:
             "ok", text, text, images=(image,),
             image_provenance={"provider": "gpt", "operation": "generate"},
         )
+
+
+def audit_rejection_summary(reason: str) -> str:
+    normalized = " ".join(reason.split())
+    prefix = "审核未通过："
+    available = 50 - len(prefix)
+    if len(normalized) > available:
+        normalized = normalized[: available - 1].rstrip() + "…"
+    return prefix + normalized
+
+
+def image_audit_rejection_result(
+    audit: ImagePromptAuditResult, *, require_english: bool = False,
+    english_command_name: str = "NovelAI",
+) -> ConversationResult:
+    reason = (
+        f"{english_command_name} 生图提示词必须使用英文。"
+        if require_english else audit.reason.strip()
+    )
+    detail = reason
+    if audit.suggested_prompt.strip():
+        detail += f"\n\n可改为：{audit.suggested_prompt.strip()}"
+    return ConversationResult("rejected", detail, audit_rejection_summary(reason))
 
 
 async def notify_image_start(callback: ImageStartCallback | None) -> None:

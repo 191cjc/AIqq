@@ -9,6 +9,12 @@ from .models import ImageAsset
 
 class ChatReadSession(Protocol):
     @property
+    def history_page_count(self) -> int: ...
+
+    @property
+    def image_read_count(self) -> int: ...
+
+    @property
     def retrieved_record_ids(self) -> frozenset[int]: ...
 
     @property

@@ -167,9 +167,13 @@ class CodexResponsesImageTests(unittest.IsolatedAsyncioTestCase):
                 reference = validate_image(png_bytes()) if mode == "edit" else None
                 with self.assertLogs(LOGGER, level="INFO") as logs:
                     image = await service.generate(action, reference_image=reference)
-                self.assertEqual((image.mime_type, image.width, image.height), ("image/jpeg", 1024, 1024))
+                self.assertEqual((image.mime_type, image.width, image.height), ("image/jpeg", 24, 12))
                 with Image.open(BytesIO(image.data)) as actual:
                     self.assertEqual(actual.format, "JPEG")
+                    self.assertEqual(actual.size, (24, 12))
+                    for point in ((0, 0), (23, 0), (0, 11), (23, 11)):
+                        for channel, expected in zip(actual.getpixel(point), (127, 127, 255)):
+                            self.assertAlmostEqual(channel, expected, delta=3)
                 self.assertEqual(len(requests), 1)
                 request = requests[0]
                 self.assertEqual(str(request.url), "https://images.example/v1/responses")
@@ -210,15 +214,30 @@ class CodexResponsesImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(sdk.backends[0].options["api_key"], sdk.backends[1].options["api_key"])
         self.assertEqual(len(requests), 2)
 
-    async def test_custom_dimensions_select_native_tool_size_and_exact_output(self):
+    async def test_custom_dimensions_select_native_tool_size_and_preserve_composition(self):
         for mode in ("generate", "edit"):
-            for dimensions, tool_size in (
-                ((800, 800), "1024x1024"),
-                ((1080, 1920), "1024x1536"),
-                ((1920, 1080), "1536x1024"),
+            for dimensions, tool_size, returned_size in (
+                ((800, 800), "1024x1024", (96, 64)),
+                ((1080, 1920), "1024x1536", (64, 96)),
+                ((1920, 1080), "1536x1024", (80, 80)),
             ):
                 with self.subTest(mode=mode, dimensions=dimensions):
-                    service, _, requests = self.service(lambda _: response())
+                    width, height = returned_size
+                    corners = (
+                        ((0, 0), (255, 0, 0)),
+                        ((width - 1, 0), (0, 255, 0)),
+                        ((0, height - 1), (0, 0, 255)),
+                        ((width - 1, height - 1), (255, 255, 0)),
+                    )
+                    with Image.new("RGB", returned_size, "black") as original:
+                        for (x, y), color in corners:
+                            left = 0 if x == 0 else width // 2
+                            top = 0 if y == 0 else height // 2
+                            original.paste(color, (left, top, left + width // 2, top + height // 2))
+                        output = BytesIO()
+                        original.save(output, format="PNG")
+                    item = image_item(result=base64.b64encode(output.getvalue()).decode())
+                    service, _, requests = self.service(lambda _: response([completed_event([item])]))
                     action = ImageAction(
                         mode,
                         PROMPT,
@@ -232,9 +251,12 @@ class CodexResponsesImageTests(unittest.IsolatedAsyncioTestCase):
                     )
                     tool = json.loads(requests[0].content)["tools"][0]
                     self.assertEqual(tool["size"], tool_size)
-                    self.assertEqual((image.width, image.height), dimensions)
+                    self.assertEqual((image.width, image.height), returned_size)
                     with Image.open(BytesIO(image.data)) as actual:
-                        self.assertEqual(actual.size, dimensions)
+                        self.assertEqual(actual.size, returned_size)
+                        for point, color in corners:
+                            for channel, expected in zip(actual.getpixel(point), color):
+                                self.assertAlmostEqual(channel, expected, delta=3)
 
     async def test_sse_handles_arbitrary_utf8_and_event_boundaries(self):
         item = image_item()
@@ -246,7 +268,7 @@ class CodexResponsesImageTests(unittest.IsolatedAsyncioTestCase):
         stream = ChunkStream([payload[index:index + 1] for index in range(len(payload))])
         service, sdk, _ = self.service(lambda _: response(stream=stream))
         image = await service.generate(ImageAction("generate", PROMPT))
-        self.assertEqual(image.width, 1024)
+        self.assertEqual(image.width, 24)
         self.assertTrue(stream.closed)
         await self.assert_cleaned(service, sdk)
 

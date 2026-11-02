@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 
@@ -13,8 +14,20 @@ from aiqq.exceptions import (
     ReferenceImageUnavailable,
 )
 
-from .image_generation import _quota_denied, image_failure_result, notify_image_start
-from .models import ConversationRequest, ConversationResult, ImageAction, ImageAsset
+from .image_generation import (
+    _quota_denied,
+    audit_rejection_summary,
+    image_audit_rejection_result,
+    image_failure_result,
+    notify_image_start,
+)
+from .models import (
+    ConversationRequest,
+    ConversationResult,
+    ImageAction,
+    ImageAsset,
+    ImagePromptAuditResult,
+)
 from .ports import (
     ConversationAgent,
     GeneratedImageService,
@@ -30,11 +43,13 @@ from .ports import (
 
 
 logger = logging.getLogger(__name__)
+INITIAL_CHAT_HISTORY_LIMIT = 10
 PROMPT_AUDIT_UNAVAILABLE_TEXT = "审核服务暂时不可用，请稍后再试。"
 CONVERSATION_UNAVAILABLE_TEXT = "对话服务暂时不可用，请稍后再试。"
 CONTEXT_TOO_LARGE_TEXT = "完整聊天记录超过模型容量，请缩小查询范围后重试。"
 IMAGE_UNAVAILABLE_TEXT = "图片处理暂时不可用，请稍后再试。"
 OPTIONAL_IMAGE_FAILED_TEXT = "图片处理失败，本次只返回文字内容。"
+PARTIAL_IMAGE_FAILED_TEXT = "部分图片下载失败，已返回其余可用图片。"
 REFERENCE_IMAGE_FAILURE_TEXT = {
     "expired": "引用的图片已过期或已失效，请重新发送原图后再试。",
     "missing": "未找到可用的原图，请重新发送图片后再试。",
@@ -47,8 +62,6 @@ REFERENCE_IMAGE_FAILURE_TEXT = {
 REJECTION_TEXT = {
     "adult_content": "这个请求不适合在公开群聊中处理，请换一个话题。",
     "persona_override": "固定身份和表达方式不能修改，请直接告诉我需要解决的问题。",
-    "complex_research": "这次需要分别检索的目标太多，请缩小范围后再试。",
-    "too_many_questions": "一次请只问一个独立问题，我会逐个帮你处理。",
     "too_complex": "这个请求范围太大，请先拆成一个可以单次完成的任务。",
 }
 
@@ -65,7 +78,7 @@ class ConversationWorkflow:
         image_prompt_auditor: ImagePromptAuditor | None = None,
         reference_image_loader: ReferenceImageLoader | None = None,
         web_image_service: WebImageService | None = None,
-        history_message_limit: int = 50,
+        history_message_limit: int = INITIAL_CHAT_HISTORY_LIMIT,
         history_char_limit: int = 1000,
     ) -> None:
         self._prompt_auditor = prompt_auditor
@@ -77,7 +90,7 @@ class ConversationWorkflow:
         self._reference_image_loader = reference_image_loader
         self._web_image_service = web_image_service
         self._history_message_limit = history_message_limit
-        # Kept as a constructor compatibility argument; complete history is never
+        # Kept as a constructor compatibility argument; semantic history is never
         # reduced to the former character budget.
 
     async def run(
@@ -103,10 +116,11 @@ class ConversationWorkflow:
             )
         if not audit.allowed:
             text = REJECTION_TEXT.get(audit.category, "这个请求目前无法使用。")
+            reason = audit.reason.strip()
             return ConversationResult(
                 status="rejected",
-                full_text=text,
-                summary=text,
+                full_text=f"{text}\n原因：{reason}",
+                summary=audit_rejection_summary(reason),
             )
 
         reference_available = True
@@ -187,6 +201,8 @@ class ConversationWorkflow:
                 )
             except _ImageQuotaDenied as exc:
                 return _quota_denied(exc.decision)
+            except _ImagePromptRejected as exc:
+                return image_audit_rejection_result(exc.audit)
             except ReferenceImageUnavailable as exc:
                 kind = (
                     exc.kind if exc.kind in REFERENCE_IMAGE_FAILURE_TEXT
@@ -227,35 +243,49 @@ class ConversationWorkflow:
         full_text = output.full_text
         if (
             not images
-            and output.selected_web_image_url is not None
+            and output.selected_web_image_urls
             and self._web_image_service is not None
         ):
-            try:
-                images = (
-                    await self._web_image_service.download(
-                        output.selected_web_image_url
-                    ),
-                )
+            urls = output.selected_web_image_urls
+            downloaded = await asyncio.gather(*(
+                self._download_web_image(url, current_request_id) for url in urls
+            ))
+            images = tuple(image for image in downloaded if image is not None)
+            if images:
                 image_provenance = {
                     "provider": "web", "operation": "download",
-                    "source_url": output.selected_web_image_url,
+                    "source_urls": [
+                        url for url, image in zip(urls, downloaded) if image is not None
+                    ],
                 }
-            except Exception as exc:
-                logger.warning(
-                    "event=conversation_web_image_failed request_id=%s error_type=%s",
-                    current_request_id,
-                    type(exc).__name__,
+            if len(images) < len(urls):
+                failure_text = (
+                    PARTIAL_IMAGE_FAILED_TEXT if images else OPTIONAL_IMAGE_FAILED_TEXT
                 )
-                full_text = full_text.rstrip() + "\n\n" + OPTIONAL_IMAGE_FAILED_TEXT
+                full_text = full_text.rstrip() + "\n\n" + failure_text
 
         return ConversationResult(
             status="ok",
             full_text=full_text,
             summary=output.summary,
-            images=images[:1],
+            images=images,
             sources=output.sources,
             image_provenance=image_provenance,
         )
+
+    async def _download_web_image(
+        self, url: str, request_id: str,
+    ) -> ImageAsset | None:
+        assert self._web_image_service is not None
+        try:
+            return await self._web_image_service.download(url)
+        except Exception as exc:
+            logger.warning(
+                "event=conversation_web_image_failed request_id=%s error_type=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            return None
 
     async def _execute_image_action(
         self, group_id: str, conversation_key: str, action: ImageAction,
@@ -267,7 +297,7 @@ class ConversationWorkflow:
             raise RuntimeError("image prompt auditor is not configured")
         audit = await self._image_prompt_auditor.audit(action.prompt)
         if not audit.safe or not audit.effective:
-            raise RuntimeError("generated image prompt was rejected")
+            raise _ImagePromptRejected(audit)
         reference = None
         if action.mode == "edit":
             if self._reference_image_loader is None or action.source_record_id is None:
@@ -309,6 +339,12 @@ class ConversationWorkflow:
             )
             return _unavailable(IMAGE_UNAVAILABLE_TEXT, "image_quota_unavailable")
         return None
+
+
+class _ImagePromptRejected(RuntimeError):
+    def __init__(self, audit: ImagePromptAuditResult) -> None:
+        super().__init__("image prompt rejected")
+        self.audit = audit
 
 
 class _ImageQuotaDenied(RuntimeError):

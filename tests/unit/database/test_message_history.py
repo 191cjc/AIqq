@@ -56,7 +56,10 @@ class CompleteHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(wire["attachments"]), 25)
         self.assertEqual(wire["attachments"][24]["image_attachment_index"], 24)
         current = await self.repository.get_current_for_reference("group-1", "complete")
-        self.assertEqual(current.record, wire)
+        self.assertEqual(current.content, envelope["d"]["content"])
+        self.assertEqual(current.image_attachment_indexes, tuple(range(25)))
+        self.assertEqual(current.recall_state, "unobserved")
+        self.assertEqual(current.record, {})
         self.assertCountEqual(self.path.parent.iterdir(), [self.path, self.path.with_name("messages.db-wal"), self.path.with_name("messages.db-shm")])
 
     async def test_missing_duplicate_fields_enrich_without_erasing_and_conflicts_have_versions(self):
@@ -83,6 +86,27 @@ class CompleteHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(history["events"]), 4)
         self.assertEqual(history["events"][0]["status"], "duplicate")
         self.assertEqual(len(full["attachments"]), 1)
+
+    async def test_compact_history_is_explicit_and_complete_default_is_preserved(self):
+        full = await self._capture("compact", image=True, content="semantic text")
+
+        compact = await self.repository.query_history("group-1", compact=True)
+        raw = await self.repository.query_history("group-1")
+
+        message = compact["messages"][0]
+        self.assertEqual(message["record_id"], full["record"]["record_id"])
+        self.assertEqual(message["content"], "semantic text")
+        self.assertEqual(message["image_attachment_indexes"], [0])
+        self.assertNotIn("record", message)
+        self.assertNotIn("payload", message)
+        self.assertIn("record", raw["messages"][0])
+        self.assertIn("payload", raw["messages"][0])
+
+        diagnostic = await self.repository.query_history(
+            "group-1", compact=True, versions=True
+        )
+        self.assertIn("record", diagnostic["messages"][0])
+        self.assertIn("payload", diagnostic["messages"][0])
 
     async def test_projection_failure_and_restart_preserve_raw_and_only_recover_local_state(self):
         event, envelope = group_event("failed")
@@ -277,6 +301,31 @@ class CompleteHistoryTests(unittest.IsolatedAsyncioTestCase):
                                                metadata={"width": 20})
         measured = await self.repository.get_image_attachment("group-1", wire["record"]["record_id"])
         self.assertEqual(measured["measured_metadata"], {"width": 20})
+
+    async def test_confirmed_member_recall_preserves_content_and_is_group_scoped(self):
+        await self._capture("request", content="/Nai v5 作图 白猫")
+        await self._capture("request", group_id="other", content="other group")
+        self.assertFalse(await self.repository.mark_recalled(group_id="group-1", message_id="request"))
+        self.assertTrue(await self.repository.mark_member_recalled(
+            group_id="group-1", message_id="request", recalled_at="2026-10-12T00:00:00Z",
+        ))
+        await self._capture("request", content="/Nai v5 作图 白猫")
+        wire = await self.repository.get_full_message("group-1", "request")
+        self.assertEqual(wire["record"]["content"], "/Nai v5 作图 白猫")
+        self.assertEqual(wire["record"]["recalled_at"], "2026-10-12T00:00:00Z")
+        self.assertEqual(wire["derived"]["recall_state"], "confirmed")
+        other = await self.repository.get_full_message("other", "request")
+        self.assertEqual(other["derived"]["recall_state"], "unobserved")
+
+    async def test_member_recall_before_late_create_replays_without_business_side_effects(self):
+        self.assertFalse(await self.repository.mark_member_recalled(
+            group_id="group-1", message_id="late", recalled_at="2026-10-12T00:00:00Z",
+        ))
+        await self._capture("late")
+        wire = await self.repository.get_full_message("group-1", "late")
+        self.assertEqual(wire["derived"]["recall_state"], "confirmed")
+        self.assertEqual(wire["record"]["recalled_at"], "2026-10-12T00:00:00Z")
+        self.assertEqual((await self.repository.storage_status())["unprojected_events"], 0)
 
     async def test_local_recall_before_late_create_is_monotonic_and_blocks_old_image_version(self):
         self.assertFalse(await self.repository.mark_recalled(group_id="group-1", message_id="bot", recalled_at="2026-09-16T01:00:00Z"))

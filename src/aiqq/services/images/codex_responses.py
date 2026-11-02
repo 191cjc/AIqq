@@ -298,7 +298,7 @@ class CodexResponsesImageService:
     async def _run(
         self, state, action, reference_image, fields, secret_values, started
     ) -> ImageAsset:
-        image_size, target_size = _resolve_image_size(action)
+        image_size = _resolve_image_size(action)
 
         async def handle(request: web.Request) -> web.Response:
             authorization = request.headers.get("Authorization", "")
@@ -337,7 +337,6 @@ class CodexResponsesImageService:
                 })
                 image, stream = await self._forward(
                     state, body, headers, fields, secret_values, started,
-                    target_size,
                 )
                 state.finish(image)
                 return web.Response(body=stream, content_type="text/event-stream")
@@ -384,6 +383,7 @@ class CodexResponsesImageService:
                 max_concurrent=1,
             )
             sdk_task = asyncio.create_task(backend.run(
+                purpose="image_generation",
                 instructions="Generate exactly one requested image, then acknowledge completion.",
                 model_input=SAFE_IMAGE_INSTRUCTION + action.prompt,
                 output_schema=ACKNOWLEDGEMENT_SCHEMA,
@@ -414,7 +414,7 @@ class CodexResponsesImageService:
             state.result.cancel()
 
     async def _forward(
-        self, state, body, headers, fields, secret_values, started, target_size
+        self, state, body, headers, fields, secret_values, started
     ):
         for retry_index in range(len(BAD_GATEWAY_RETRY_DELAYS) + 1):
             state.status, state.provider_request_id = None, None
@@ -453,7 +453,6 @@ class CodexResponsesImageService:
                     image = await asyncio.to_thread(
                         _decode_and_normalize,
                         SimpleNamespace(data=[SimpleNamespace(b64_json=parser.encoded)]),
-                        target_size,
                     )
                     return image, b"".join(chunks)
             await _retry_sleep(delay)

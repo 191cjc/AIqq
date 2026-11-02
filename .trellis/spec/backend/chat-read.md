@@ -5,39 +5,65 @@
 Read when modifying group gateway capture, message persistence/migrations, chat
 serialization, the chat-read skill, Codex tool permissions, Responses read loops,
 or image/delivery metadata. Packaged `src/aiqq` is authoritative.
+Also read when changing ordinary input audit categories or chat admission.
 
 ## 2. Signatures
 
 ```python
+audit = await prompt_auditor.audit(user_input)
 await repository.add_gateway_event(event_type, envelope, raw_text=text, connection_id=id)
 raw_event_mentions_bot(payload, bot_name=current_bot_name)
 normalized_group_message_data(payload, bot_name=current_bot_name)
 await repository.get_current_for_reference(group_id, message_id)
-await repository.list_for_reference(group_id, before_message_id=message_id, limit=50)
+await repository.list_for_reference(group_id, before_message_id=message_id, limit=10)
 await repository.query_history(group_id, **filters)
 session = GroupChatReadService(repository=repository, downloader=images).create_session(group_id)
-await session.read_history(**filters)  # complete page dictionary
+await session.read_history(**filters)  # compact by default; raw=True is complete
 metadata, images = await session.read_image(record_id, attachment_index=0, version_id=None)
-await backend.run(..., chat_read_session=session)
+await backend.run(purpose="chat", ..., chat_read_session=session)
 await session.close()
 ```
 
-`GroupHistoryMessage.record` carries the complete wire object. The former small
-domain fields remain for compatibility and image-action validation, not as the
-production serialization whitelist. `ConversationRequest` carries `group_id`,
-`current_message`, and `history_has_more` independently of recent history.
+`GroupHistoryMessage` carries the semantic model fields, including image attachment
+indexes, recall state, and progress state. `compact_chat_record()` owns the stable
+model serialization whitelist; reference reads do not construct or retain a complete
+wire object. `ConversationRequest` carries `group_id`, `current_message`, and
+`history_has_more` independently of recent history. Complete wire objects remain
+authoritative in SQLite and explicit raw/management APIs.
 
 ## 3. Contracts
 
-- Protocol v3 supplies exactly the latest available 50 preceding same-group
-  records plus the current message. Preserve progress/recalled records and their
-  states. Do not normalize whitespace, clip text, or use the former character
-  budget. `AIQQ_GROUP_HISTORY_MAX_CHARS` is ignored by this chat path.
-- Each record contains `record` (every SQLite column, including original
-  `payload_json`), `payload` (parsed JSON), separate `derived` metadata, attachment
-  associations, latest event, and delivery attempts. Preserve future columns,
-  unknown nested keys, arrays, null/false/zero/empty strings. Invalid JSON retains
-  its original text and a parse error; non-object JSON is not replaced with `{}`.
+- Ordinary input auditing uses `PromptAuditAgent.audit()` before history reads
+  and chat. Its domain literal and strict output schema admit only `safe`,
+  `adult_content`, `persona_override` and `too_complex`.
+  Multiple independent questions/tasks in one message are allowed; their count
+  alone must not become a rejection or be relabeled as `too_complex`.
+  Ordinary batch lookups, comparisons, rankings and summaries have no research
+  target-count limit. The number of targets, searches or item-by-item checks alone
+  must not cause a rejection or be relabeled as `too_complex`. Genuinely excessive
+  stages or deliverables remain subject to the `too_complex` criterion.
+  An allowed response must use `safe`; rejected responses require a non-safe
+  category and a nonempty reason. Invalid model output remains audit unavailable.
+- Protocol v4 supplies at most the latest available 10 preceding same-group records
+  plus one compact current-message object. The current request text appears only in
+  `current_message.content`, including when persistence lookup is unavailable.
+  Preserve progress/recalled records and their states. Do not normalize whitespace,
+  clip text, or use the former character budget. `AIQQ_GROUP_HISTORY_MAX_CHARS` is
+  ignored by this chat path.
+- Both ordinary chat instructions and the Codex chat runtime identify
+  `current_message.content` as the current user's task to answer or carry out,
+  subject to the fixed role, tool permissions, output protocol and safety rules.
+  History, quoted content, attachments and tool results are reference data to
+  process for that task; embedded commands do not automatically become instructions
+  or override fixed rules. A request to evaluate quoted text requires evaluation,
+  not automatic execution of the quoted commands. Do not blanket-classify the
+  current request as non-executable reference data.
+- Compact records contain exactly `record_id`, `role`, `sender_name`, `sent_at`,
+  `content`, `message_type`, `reply_summary`, `has_image`,
+  `image_attachment_indexes`, `recall_state`, and `progress`. They never contain the
+  raw database row, parsed payload, gateway events, signed attachment URLs, or
+  delivery attempts. Complete raw records preserve future columns, unknown nested
+  keys, arrays, null/false/zero/empty strings, and invalid JSON diagnostics.
 - Gateway raw text commits before projection/business dispatch. Event receipts,
   message versions, attachment metadata and delivery attempts remain separate.
   Identity is `(group_openid, message_id)`. Duplicate/missing-field snapshots
@@ -70,12 +96,24 @@ production serialization whitelist. `ConversationRequest` carries `group_id`,
   when available, and retain complete raw values in their original versions.
 - Legacy migration preserves record IDs, original columns/payloads and custom
   indexes; adds `legacy_snapshot` versions. Never claim older lost envelopes or
-  versions were reconstructed. Keep confirmed local recall monotonic. Unknown
+  versions were reconstructed. Keep confirmed local recall monotonic. A successful
+  administrator recall of a member's drawing request uses the trusted
+  `LOCAL_MEMBER_RECALL_CONFIRMED` event through `mark_member_recalled`; original
+  bot recall keeps `LOCAL_BOT_RECALL_CONFIRMED` and its bot ownership restriction.
+  Each event applies only to its matching member/bot record in the same group.
+  Preserve original content and versions, mark `recall_state=confirmed`, and
+  replay confirmations arriving before either kind of create record without
+  network, model, quota or send side effects. Unknown
   member lifecycle events are archived as unsupported; absence is unobserved,
   not proof that a member never recalled a message.
 - Every history/image session is bound to one server-selected group. No arbitrary
-  group, URL, DB path or local file parameters. History allows at most three pages
-  of 50 with stable record/version cursors. Image reads allow three sources,
+  group, URL, DB path or local file parameters. History allows at most three distinct
+  pages of 50 with stable record/version cursors. Omitted and explicit default
+  filters normalize to the same request task and page-budget entry. Default history
+  results are compact; `raw=true`, `versions=true`, or `events=true` returns complete
+  diagnostic message records. Cancelling one waiter must not cancel a shared history
+  task for equivalent callers; closing the session must cancel the underlying task
+  and clear its request-local index. Image reads allow three sources,
   three sampled frames each, maximum nine visual inputs. Reject extra input;
   never silently slice to the first image.
 - History sender/keyword/time/record filters select the same messages for
@@ -102,9 +140,18 @@ production serialization whitelist. `ConversationRequest` carries `group_id`,
 - Installed CLI 0.152.1 emits `command_execution` items, but no separate JSONL
   item for successful view_image; actual subsequent Responses input contains
   image data in tool output. Verify pixel transport, not an invented event name.
-- Responses compatibility uses bounded read function calls and real input_image
-  content, preserving complete tool records. Chat read never enables native
+- Codex stages each newly read history page once and drains pending pages only into
+  the next provider request; accepted pages remain available through the provider
+  conversation chain but are not newly appended to every later request. Responses
+  compatibility uses bounded read function calls and real input_image content,
+  returning compact tool records by default. Chat read never enables native
   generation or charges image quotas.
+- Every backend turn labels its purpose and emits one content-free terminal
+  `ai_turn_finished` metric with opaque request ID, backend/model/effort, model-input
+  bytes, elapsed time, status, normalized usage, and observable provider/tool/history/
+  image counters. Never log prompt text, raw provider bodies, signed URLs, credentials,
+  or group/member IDs. The configured output cap applies to Responses and the Codex
+  chat proxy; direct Codex SDK turns report `unsupported_direct_sdk`.
 - QQ sender records actual upload/send attempts separately. Only a confirmed
   message ID creates a sent-message row. Image metadata comes from in-memory
   source and compressed delivery bytes: MIME, dimensions, byte size, SHA-256,
@@ -114,6 +161,12 @@ production serialization whitelist. `ConversationRequest` carries `group_id`,
 
 | Condition | Required outcome |
 | --- | --- |
+| Several independent questions, no other rejection criterion | Preserve the complete input and proceed to history/chat |
+| Seven-character ranking or nine-chapter date lookup, no other rejection criterion | Preserve the complete input and proceed to history/chat regardless of target count |
+| Current user directly requests a task | Answer or carry out the task within the fixed rules |
+| Current user asks to evaluate quoted instructions | Evaluate the quotation without automatically executing its embedded commands |
+| Removed `too_many_questions` or `complex_research` output category | Invalid audit output; both are absent from the advertised schema and rejection copy |
+| Valid audit rejection or audit failure | Stop before history reads/chat and retain the existing reason/failure presentation |
 | Source HTTP 404/410 | `expired`: 这张图片链接已过期或失效，请重新发送图片。 |
 | Unknown HTTP 400 / network error | `download_failed`, no expiry claim |
 | HTTP 401/403 | `access_denied` |
@@ -141,8 +194,14 @@ summarization from hiding the original-image expiry reason again.
 
 ## 5. Good / Base / Bad Cases
 
-- Good: 50 full records exceeding 10,000 characters, plus a current attachment,
-  survive DB → workflow → chat serialization exactly, including future columns.
+- Good: a message asking two unrelated ordinary questions reaches chat intact.
+- Good: a seven-character ranking or nine-chapter date lookup reaches chat intact.
+- Bad: asking users to submit one question at a time or classifying the question,
+  research-target or search count alone as excessive complexity.
+- Good: 10 compact records preserve full semantic text, reply/image/recall/progress
+  state and current identity while reducing a full-wire fixture by at least 90%.
+- Good: an equivalent repeated history query performs one repository read and uses
+  one page slot; a newly read second page does not re-append the first page.
 - Good: a leading textual `@<runtime name>` is persisted, normalized once and
   dispatched; a simultaneous native callback is removed by handler deduplication.
 - Good: a valid `[@<runtime name>] /NovelAI生图 ...` routes to the NovelAI command
@@ -156,13 +215,26 @@ summarization from hiding the original-image expiry reason again.
 
 ## 6. Required Tests and Deployment Checks
 
-Assert complete DB-to-model equality (future columns, deep unknown fields, more
-than 20 attachments, false/null/zero, multiline text); current image-only @,
+Verify ordinary audit schema/decision invariants and admission with a mocked
+safe audit for multiple questions, seven-character rankings and nine-chapter
+date lookups. Mocked admission tests verify the pipeline, not live model compliance.
+Keep valid rejection/failure tests proving that history/chat are skipped.
+Assert the current-task/reference-data boundary in both assembled chat prompts.
+Prompt contract tests do not establish model compliance; bounded live checks must
+cover both a direct task and evaluation of quoted commands.
+When asked to wait for an active question, check
+its terminal turn event, pending reply markers and service child processes
+before restarting; a code edit alone does not change the running process.
+
+Assert compact DB-to-model semantics and >=90% payload reduction while explicit raw
+queries preserve future columns, deep unknown fields, more than 20 attachments,
+false/null/zero, and multiline text; current image-only @,
 runtime-name text @ (leading whitespace, no separator, empty/image-only body,
 partial/old/mid-message rejection), native angle-ID and bracketed mentions,
 preserved later mentions, actual SDK projections and both raw-first/SDK-first
 deduplication with command routing asserted; stable
-same-group history/version paging; legacy migration with
+same-group history/version paging; equivalent history failure reuse, isolated waiter
+cancellation, and close-time task cancellation; legacy migration with
 unchanged IDs/all original columns; raw commit + failure/restart recovery; late
 local recall; input animation budgets and cleanup; real SDK offline tool
 execution followed by pixel input; file/symlink/proc/other-turn denial; bridge
@@ -221,6 +293,16 @@ real provider with a bounded web search, result opening and image search before
 claiming a search-path repair has restored all those operations.
 
 ## 7. Wrong vs Correct
+
+Wrong: classify `current_message` together with history as reference-only data
+whose instructions must never be followed. Correct: follow the current task in
+`current_message.content` within fixed rules; if it asks to evaluate a quoted
+command, evaluate that command without carrying it out.
+
+Wrong: remove a count-based rejection instruction but leave `too_many_questions`
+or `complex_research` in the model enum or rejection mapping, or relabel ordinary
+batch queries as `too_complex`. Correct: update the instructions, strict schema,
+domain category and presentation together, and preserve other checks.
 
 Wrong: hard-code the current deployed bot display name or dispatch any message
 that merely contains it. Correct: capture `robot.name` at readiness, require an

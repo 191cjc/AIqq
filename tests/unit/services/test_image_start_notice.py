@@ -58,6 +58,7 @@ class ImageRequestFixture:
             send_markdown_reply=self.send_markdown,
             send_image_reply=self.send_image,
             recall_from_group=self.recall,
+            recall_member_message=self.recall_member,
         )
         self.reply_store = SimpleNamespace(
             save=AsyncMock(return_value=SimpleNamespace(public_url="https://example/full")),
@@ -180,6 +181,10 @@ class ImageRequestFixture:
             self.events.append("notice")
             if self.notice_error:
                 raise self.notice_error
+        elif kwargs["content"].startswith("已收到提示词，"):
+            self.events.append("receipt")
+            if self.notice_error:
+                raise self.notice_error
         else:
             self.events.append("progress" if kwargs.get("progress") else "fallback")
             if kwargs.get("progress") and self.progress_error:
@@ -196,6 +201,11 @@ class ImageRequestFixture:
     async def send_image(self, **kwargs):
         self.sends.append(("image", kwargs))
         self.events.append("image")
+
+    async def recall_member(self, **kwargs):
+        self.events.append("member_recall")
+        self.recalled.append(kwargs["message_id"])
+        return "recalled"
 
     async def recall(self, target):
         self.recalled.append(target.message_id)
@@ -222,7 +232,39 @@ class ImageRequestFixture:
 
 
 class ImageStartNoticeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_notice_after_admission_before_each_provider_and_final_delivery(self):
+    async def test_recall_failure_and_chinese_translation_share_one_immediate_receipt(self):
+        fixture = ImageRequestFixture("novelai")
+
+        async def denied(**kwargs):
+            fixture.events.append("member_recall")
+            return "permission_denied"
+
+        async def quick(*args, on_image_start, **kwargs):
+            self.assertEqual(fixture.events, ["member_recall", "receipt"])
+            await on_image_start()
+            await on_image_start()
+            fixture.events.append("generate")
+            return ConversationResult("ok", "done", "done", images=(fixture.image,), generation_prompt="white cat")
+
+        fixture.sender.recall_member_message = denied
+        fixture.router._novelai_quick_image_workflow.run = quick
+        handler = fixture.handler()
+        message = fixture.message(prompt="白猫")
+        self.assertTrue(await handler.handle(message))
+        self.assertFalse(await handler.handle(message))
+        notices = [kwargs for kind, kwargs in fixture.sends if kind == "text"]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("已收到提示词", notices[0]["content"])
+        self.assertIn("原消息未撤回", notices[0]["content"])
+        self.assertIn("正在转换为英文提示词", notices[0]["content"])
+        self.assertNotIn("已撤回", notices[0]["content"])
+        self.assertEqual(fixture.events, ["member_recall", "receipt", "generate", "final", "image"])
+        self.assertEqual(fixture.sequences(), [1, 2, 3])
+        button = fixture.sends[1][1]["keyboard"]["content"]["rows"][-1]["buttons"][0]
+        self.assertEqual(button["id"], "view_generation_prompt")
+        self.assertTrue(button["action"]["data"].endswith("?view=prompt"))
+
+    async def test_novelai_receipt_is_immediate_and_other_notices_follow_admission(self):
         for provider in ("gpt", "novelai", "generate", "edit"):
             for slash in (False, True):
                 with self.subTest(provider=provider, slash=slash):
@@ -235,19 +277,28 @@ class ImageStartNoticeTests(unittest.IsolatedAsyncioTestCase):
                     before += ["audit"]
                     if provider == "edit":
                         before += ["reference"]
-                    self.assertEqual(fixture.events, before + [
-                        "reserve", "notice", "generate", "success", "finish", "final", "image"
-                    ])
+                    if provider == "novelai":
+                        expected = ["member_recall", "receipt"] + before + [
+                            "reserve", "generate", "success", "finish", "final", "image"
+                        ]
+                    else:
+                        expected = before + [
+                            "reserve", "notice", "generate", "success", "finish", "final", "image"
+                        ]
+                    self.assertEqual(fixture.events, expected)
                     self.assertEqual(fixture.sequences(), [1, 2, 3])
                     kind, notice = fixture.sends[0]
                     self.assertEqual(kind, "text")
-                    self.assertEqual(notice["content"], IMAGE_START_NOTICE_TEXT)
+                    if provider == "novelai":
+                        self.assertIn("已收到提示词，原消息已撤回。", notice["content"])
+                    else:
+                        self.assertEqual(notice["content"], IMAGE_START_NOTICE_TEXT)
                     self.assertEqual(notice["group_id"], "group")
                     self.assertEqual(notice["source_message_id"], "source")
                     self.assertEqual(notice["fallback_member_openid"], "member")
-                    self.assertTrue(notice["quote_source"])
+                    self.assertEqual(notice.get("quote_source", False), provider != "novelai")
                     self.assertFalse(notice.get("progress", False))
-                    self.assertEqual(fixture.recalled, [])
+                    self.assertEqual(fixture.recalled, ["source"] if provider == "novelai" else [])
 
     async def test_rejected_requests_never_announce_or_generate(self):
         for provider in ("gpt", "novelai", "generate", "edit"):
@@ -263,7 +314,7 @@ class ImageStartNoticeTests(unittest.IsolatedAsyncioTestCase):
                     await fixture.handler().handle(fixture.message())
                     self.assertNotIn("notice", fixture.events)
                     self.assertNotIn("generate", fixture.events)
-                    self.assertEqual(fixture.sequences(), [1])
+                    self.assertEqual(fixture.sequences(), [1, 2] if provider == "novelai" else [1])
         for provider in ("gpt", "novelai"):
             fixture = ImageRequestFixture(provider)
             await fixture.handler().handle(fixture.message(prompt=""))
@@ -275,7 +326,7 @@ class ImageStartNoticeTests(unittest.IsolatedAsyncioTestCase):
         fixture = ImageRequestFixture("novelai")
         fixture.style_error = RuntimeError("private style")
         await fixture.handler().handle(fixture.message())
-        self.assertEqual(fixture.events, ["style", "final"])
+        self.assertEqual(fixture.events, ["member_recall", "receipt", "style", "final"])
 
     async def test_text_web_search_and_prompt_or_style_commands_have_no_notice(self):
         for content in ("/NovelAI提示词 cat", "/NovelAI画风 watercolor", "/NovelAI画风"):
@@ -285,7 +336,7 @@ class ImageStartNoticeTests(unittest.IsolatedAsyncioTestCase):
         for web_url in (None, "https://example/cat"):
             fixture = ImageRequestFixture("generate")
             fixture.chat_output = ChatAgentOutput(
-                "文字回答", "文字回答", selected_web_image_url=web_url
+                "文字回答", "文字回答", selected_web_image_urls=(web_url,) if web_url else ()
             )
             await fixture.handler().handle(fixture.message())
             self.assertNotIn("notice", fixture.events)
@@ -296,12 +347,14 @@ class ImageStartNoticeTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(provider=provider):
                 fixture = ImageRequestFixture(provider)
                 fixture.notice_error = RuntimeError("private url token member prompt")
-                with self.assertLogs("aiqq.logic.image_generation", "WARNING") as logs:
+                log_module = "aiqq.interfaces.qq.command_router" if provider == "novelai" else "aiqq.logic.image_generation"
+                with self.assertLogs(log_module, "WARNING") as logs:
                     await fixture.handler().handle(fixture.message())
+                event = "image_request_acknowledgement_failed" if provider == "novelai" else "image_start_notice_failed"
                 self.assertEqual([record.getMessage() for record in logs.records], [
-                    "event=image_start_notice_failed error_type=RuntimeError"
+                    f"event={event} error_type=RuntimeError"
                 ])
-                self.assertEqual(fixture.events.count("notice"), 1)
+                self.assertEqual(fixture.events.count("receipt" if provider == "novelai" else "notice"), 1)
                 self.assertEqual(fixture.events.count("generate"), 1)
                 self.assertEqual(fixture.sequences(), [1, 2, 3])
 
@@ -354,7 +407,10 @@ class ImageStartNoticeTests(unittest.IsolatedAsyncioTestCase):
                     await fixture.handler(workflow=SimpleNamespace(run=duplicate)).handle(
                         fixture.message()
                     )
-                    self.assertEqual(fixture.events, ["notice", "final"])
+                    self.assertEqual(fixture.events, (
+                        ["member_recall", "receipt", "final"]
+                        if provider == "novelai" else ["notice", "final"]
+                    ))
                     self.assertEqual(fixture.sequences(), [1, 2])
 
     async def test_late_start_uses_live_sequence_after_deferred_notice(self):

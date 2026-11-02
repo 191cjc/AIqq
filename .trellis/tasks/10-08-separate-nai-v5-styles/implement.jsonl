@@ -1,0 +1,2 @@
+{"file":".trellis/spec/backend/novelai-style.md","reason":"Existing persistence, command, prompt composition and style error contracts"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace QQ commands through provider-specific storage to image generation"}

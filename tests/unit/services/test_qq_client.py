@@ -64,7 +64,7 @@ class QQClientTests(unittest.IsolatedAsyncioTestCase):
         conversation = SimpleNamespace(run=AsyncMock(return_value=result))
         novelai = SimpleNamespace(run=AsyncMock(return_value=result))
         gpt = SimpleNamespace(run=AsyncMock(return_value=result))
-        replies = SimpleNamespace(send=AsyncMock())
+        replies = SimpleNamespace(send=AsyncMock(), acknowledge_image_request=AsyncMock())
         sender = SimpleNamespace(send_text_reply=AsyncMock())
         router = ExplicitCommandRouter(
             reply_sender=replies,
@@ -279,6 +279,11 @@ class QQClientTests(unittest.IsolatedAsyncioTestCase):
                     conversation.run.assert_not_awaited()
                     gpt.run.assert_not_awaited()
                     replies.send.assert_awaited_once()
+                    replies.acknowledge_image_request.assert_awaited_once_with(
+                        group_id="group-1", source_message_id="message-1",
+                        member_openid="member-1", msg_seq=1, translate_prompt=False,
+                    )
+                    self.assertEqual(replies.send.await_args.kwargs["first_msg_seq"], 2)
                     sender.send_text_reply.assert_not_awaited()
 
     async def test_raw_bracketed_text_mention_without_metadata_routes_to_novelai(self):
@@ -296,6 +301,38 @@ class QQClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(callable(novelai.run.await_args.kwargs["on_image_start"]))
         conversation.run.assert_not_awaited()
         gpt.run.assert_not_awaited()
+
+    async def test_nai_v5_short_command_routes_from_raw_and_sdk_with_actual_sender(self):
+        scene = "2girls, church|girl, blue eyes,\n 1.1::white hair::, sitting"
+        for callback in ("raw", "sdk"):
+            for prefix in ("@浴火AI猫娘助手", "<@bot-id>"):
+                with self.subTest(callback=callback, prefix=prefix):
+                    client, _repository, conversation, novelai, gpt, replies, sender = self.make_routing_client()
+                    client._bot_name = "浴火AI猫娘助手"
+                    nai_v5 = SimpleNamespace(run=AsyncMock(return_value=ConversationResult("ok", "complete", "complete")))
+                    client._components.message_handler._command_handler._nai_v5_image_workflow = nai_v5
+                    event = payload(mentions=[], content=f"{prefix} /Nai v5 {scene}")
+                    event["d"]["author"] = {"member_openid": "trusted-bot", "bot": True}
+                    if callback == "raw":
+                        await client._handle_raw_group_message("GROUP_AT_MESSAGE_CREATE", event)
+                        await asyncio.gather(*client._message_tasks)
+                    else:
+                        await client.on_group_at_message_create(GroupMessage(client.api, event["id"], event["d"]))
+
+                    nai_v5.run.assert_awaited_once_with(
+                        scene, conversation_key="group:group-1:member:trusted-bot",
+                        member_openid="trusted-bot", on_image_start=ANY,
+                    )
+                    conversation.run.assert_not_awaited()
+                    novelai.run.assert_not_awaited()
+                    gpt.run.assert_not_awaited()
+                    replies.acknowledge_image_request.assert_awaited_once_with(
+                        group_id="group-1", source_message_id="message-1",
+                        member_openid="trusted-bot", msg_seq=1, translate_prompt=False,
+                    )
+                    replies.send.assert_awaited_once()
+                    self.assertEqual(replies.send.await_args.kwargs["first_msg_seq"], 2)
+                    sender.send_text_reply.assert_not_awaited()
 
     async def test_ingress_and_handler_preserve_second_mention_as_body(self):
         for callback in ("raw", "sdk"):

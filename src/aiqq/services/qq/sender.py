@@ -9,12 +9,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from botpy.errors import ServerError
+from botpy.errors import ForbiddenError, ServerError
 from botpy.http import Route
 
 from aiqq.exceptions import ImageContentRejected
 from aiqq.logic.models import BotSentGroupMessage
-from aiqq.logic.ports import BotMessageRepository
+from aiqq.logic.ports import BotMessageRepository, MemberMessageRecallStatus
 
 
 logger = logging.getLogger(__name__)
@@ -381,6 +381,52 @@ class QQMessageSender:
             )
             return False
         return recorded
+
+    async def recall_member_message(
+        self, *, group_id: str, message_id: str
+    ) -> MemberMessageRecallStatus:
+        """Recall the incoming request; QQ enforces administrator permissions."""
+        if not group_id or not message_id:
+            return "failed"
+        route = Route(
+            "DELETE", "/v2/groups/{group_openid}/messages/{message_id}",
+            group_openid=group_id, message_id=message_id,
+        )
+        try:
+            await self._api._http.request(route)
+        except (ForbiddenError, ServerError) as exc:
+            details = exc.args[0] if exc.args and isinstance(exc.args[0], dict) else {}
+            code = details.get("code") or details.get("err_code")
+            # botpy 1.2.1 discards the JSON error code and keeps only message.
+            message = getattr(exc, "msgs", "")
+            if not isinstance(message, str):
+                message = ""
+            status: MemberMessageRecallStatus = {
+                40062003: "permission_denied", 40064004: "expired",
+            }.get(code, {
+                "无操作权限": "permission_denied",
+                "已超出消息撤回时限": "expired",
+            }.get(message, "failed"))
+            if isinstance(exc, ForbiddenError):
+                status = "permission_denied"
+            logger.warning("event=member_message_recall_failed error_kind=%s", status)
+            return status
+        except Exception as exc:
+            logger.warning(
+                "event=member_message_recall_failed error_type=%s", type(exc).__name__
+            )
+            return "failed"
+        try:
+            await self._repository.mark_member_recalled(
+                group_id=group_id, message_id=message_id,
+                recalled_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            )
+        except Exception as exc:
+            # The remote recall already succeeded; local recording cannot undo it.
+            logger.warning(
+                "event=member_message_recall_record_failed error_type=%s", type(exc).__name__
+            )
+        return "recalled"
 
 
 def _mention_member(content: str, member_openid: str) -> str:

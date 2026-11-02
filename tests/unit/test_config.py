@@ -12,6 +12,24 @@ BASE_ENV = {
 
 
 class ConfigTests(unittest.TestCase):
+    def test_image_audit_whitelist_defaults_empty_and_is_independent_of_quota(self):
+        defaults = AppConfig.from_env(BASE_ENV)
+        self.assertEqual(defaults.images.image_audit_whitelist, frozenset())
+        quota_only = AppConfig.from_env({**BASE_ENV, "AIQQ_NAI_V5_WHITELIST": "quota-member"})
+        self.assertEqual(quota_only.images.image_audit_whitelist, frozenset())
+        config = AppConfig.from_env({
+            **BASE_ENV, "AIQQ_NAI_V5_WHITELIST": "quota-member",
+            "AIQQ_IMAGE_AUDIT_WHITELIST": " first-account, second-account,first-account ",
+        })
+        self.assertEqual(config.images.image_audit_whitelist,
+                         frozenset({"first-account", "second-account"}))
+        self.assertEqual(config.images.nai_v5_whitelist, frozenset({"quota-member"}))
+
+    def test_image_audit_whitelist_rejects_malformed_member_lists(self):
+        for value in ("first,,second", "first,", "first,second account", "x" * 257):
+            with self.subTest(value=value), self.assertRaises(ConfigurationError):
+                AppConfig.from_env({**BASE_ENV, "AIQQ_IMAGE_AUDIT_WHITELIST": value})
+
     def test_codex_sdk_and_high_reasoning_are_the_defaults(self):
         config = AppConfig.from_env(BASE_ENV)
 
@@ -24,7 +42,7 @@ class ConfigTests(unittest.TestCase):
         config = AppConfig.from_env({**BASE_ENV, "OPENAI_MODEL": "chat-model"})
 
         self.assertEqual(config.images.driver_model, "gpt-6-astra")
-        self.assertEqual(config.images.model, "gpt-image-2")
+        self.assertEqual(config.images.model, "gpt-image-2.5-flare")
         overridden = AppConfig.from_env({
             **BASE_ENV,
             "OPENAI_IMAGE_DRIVER_MODEL": "custom-driver",
@@ -49,7 +67,7 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.images.api_key, config.ai.api_key)
         self.assertEqual(config.images.base_url, "https://chat.example/v1")
-        self.assertEqual(config.images.model, "gpt-image-2")
+        self.assertEqual(config.images.model, "gpt-image-2.5-flare")
 
     def test_removed_app_server_and_xhigh_values_are_rejected(self):
         with self.assertRaises(ConfigurationError):

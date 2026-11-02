@@ -20,6 +20,8 @@ from .migrations import insert_attachments
 CREATE_EVENTS = {"GROUP_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"}
 LOCAL_CREATE_EVENTS = {"BOT_MESSAGE_CREATE", "BOT_PROGRESS_MESSAGE"}
 LOCAL_RECALL_EVENT = "LOCAL_BOT_RECALL_CONFIRMED"
+LOCAL_MEMBER_RECALL_EVENT = "LOCAL_MEMBER_RECALL_CONFIRMED"
+LOCAL_RECALL_EVENTS = {LOCAL_RECALL_EVENT, LOCAL_MEMBER_RECALL_EVENT}
 
 
 def now() -> str:
@@ -111,7 +113,7 @@ class MessageEventStore:
             return False
         event_type = event["event_type"]
         if not event["group_openid"] or not event["message_id"] or event_type not in (
-            CREATE_EVENTS | LOCAL_CREATE_EVENTS | {LOCAL_RECALL_EVENT}
+            CREATE_EVENTS | LOCAL_CREATE_EVENTS | LOCAL_RECALL_EVENTS
         ):
             await _status(connection, event_record_id, "unsupported")
             return False
@@ -128,12 +130,12 @@ class MessageEventStore:
         previous = await _one(connection,
             "SELECT * FROM group_messages WHERE group_openid=? AND message_id=?",
             (event["group_openid"], event["message_id"]))
-        if event_type == LOCAL_RECALL_EVENT:
+        if event_type in LOCAL_RECALL_EVENTS:
             if previous is None:
                 # Only trusted local confirmation creates this event. Keep it
-                # pending for a late successful-send projection.
+                # pending for a late create projection.
                 return False
-            if not previous["is_bot"]:
+            if bool(previous["is_bot"]) != (event_type == LOCAL_RECALL_EVENT):
                 await _status(connection, event_record_id, "unsupported")
                 return False
             await connection.execute(
@@ -208,11 +210,12 @@ class MessageEventStore:
             assignments = ",".join(f"{name}=?" for name in values)
             await connection.execute(
                 f"UPDATE group_messages SET {assignments} WHERE record_id=?", (*values.values(), record_id))
-        if is_local:
+        recall_event_type = LOCAL_RECALL_EVENT if values["is_bot"] else LOCAL_MEMBER_RECALL_EVENT
+        if event_type in CREATE_EVENTS | LOCAL_CREATE_EVENTS:
             recall = await _one(connection,
                 "SELECT event_record_id,raw_text,received_at FROM group_message_events "
                 "WHERE group_openid=? AND message_id=? AND event_type=? ORDER BY event_record_id LIMIT 1",
-                (event["group_openid"], event["message_id"], LOCAL_RECALL_EVENT))
+                (event["group_openid"], event["message_id"], recall_event_type))
             if recall is not None:
                 recall_payload = json.loads(recall["raw_text"])["d"]
                 await connection.execute(
@@ -220,13 +223,13 @@ class MessageEventStore:
                     "recall_state='confirmed' WHERE record_id=?",
                     (string(recall_payload.get("recalled_at")) or recall["received_at"], record_id))
         await self._version(connection, event, raw_payload, record_id, conflicts)
-        if is_local:
+        if event_type in CREATE_EVENTS | LOCAL_CREATE_EVENTS:
             async with connection.execute(
                 "SELECT e.event_record_id FROM group_message_events e "
                 "JOIN message_event_processing p USING(event_record_id) "
                 "WHERE e.group_openid=? AND e.message_id=? AND e.event_type=? "
                 "AND p.status IN ('pending','failed') ORDER BY e.event_record_id",
-                (event["group_openid"], event["message_id"], LOCAL_RECALL_EVENT),
+                (event["group_openid"], event["message_id"], recall_event_type),
             ) as cursor:
                 pending_recalls = await cursor.fetchall()
             for pending_recall in pending_recalls:

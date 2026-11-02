@@ -18,11 +18,47 @@ class QQCommandsAndUITests(unittest.TestCase):
         self.assertIsNone(parse_command("清除记忆"))
         self.assertIsNone(parse_command("/新对话"))
 
+    def test_nai_v5_short_command_preserves_scene_and_command_boundaries(self):
+        for scene in ("2girls, church|girl, blue eyes,\n 1.1::white hair::", "白猫躺在窗边"):
+            for prefix in ("Nai v5", "/Nai v5"):
+                with self.subTest(scene=scene, prefix=prefix):
+                    command = parse_command(f"  {prefix}\t{scene}  ")
+                    self.assertEqual(command.name, "nai_v5_image")
+                    self.assertEqual(command.argument, scene)
+                    self.assertEqual(parse_command(f"{prefix} \n ").argument, "")
+        for content in ("Nai v50 cat", "/Nai v5cat", "请介绍 Nai v5", "/Nai v5 作图cat", "/Nai v5 画风watercolor"):
+            with self.subTest(content=content):
+                self.assertIsNone(parse_command(content))
+
+    def test_nai_v5_subcommands_take_precedence_over_short_image_command(self):
+        for prefix in ("Nai v5", "/Nai v5"):
+            for suffix, name in (("作图", "nai_v5_image"), ("画风", "nai_v5_style")):
+                with self.subTest(prefix=prefix, suffix=suffix):
+                    self.assertEqual(parse_command(f"{prefix} {suffix}").name, name)
+                    command = parse_command(f"{prefix} {suffix} white cat")
+                    self.assertEqual(command.name, name)
+                    self.assertEqual(command.argument, "white cat")
+
+    def test_style_command_tolerates_zero_width_prefix_and_label_case(self):
+        for content in (
+            "\u200b NovelAI画风 1.2::artist:mignon::",
+            "\ufeff/NovelAI画风 1.2::artist:mignon::",
+            "NovelAi画风   1.2::artist:mignon::",
+            "/novelai画风 1.2::artist:mignon::",
+        ):
+            with self.subTest(content=content):
+                command = parse_command(content)
+                self.assertEqual(command.name, "novelai_style")
+                self.assertEqual(command.argument, "1.2::artist:mignon::")
+        self.assertEqual(parse_command("nai V5 画风 watercolor").name, "nai_v5_style")
+        self.assertIsNone(parse_command("/nai v5 画风watercolor"))
+
     def test_feature_menu_has_no_gpt_or_memory_buttons(self):
         payload = str(feature_menu_keyboard())
         self.assertIn("NovelAI提示词", payload)
         self.assertIn("NovelAI生图", payload)
         self.assertIn("NovelAI画风", payload)
+        self.assertIn("Nai v5 画风", payload)
         self.assertNotIn("NovelAI快速生图", payload)
         self.assertNotIn("GPT生图", payload)
         self.assertNotIn("清除记忆", payload)
@@ -39,12 +75,13 @@ class QQCommandsAndUITests(unittest.TestCase):
         self.assertEqual(parse_command("NovelAI提示词 白猫").name, "novelai_prompt")
 
     def test_style_command_preserves_weights_and_internal_newlines(self):
-        for prefix in ("NovelAI画风", "/NovelAI画风"):
-            command = parse_command(f" {prefix}  {{{{watercolor}}}},\nsoft lighting ")
-            self.assertEqual(command.name, "novelai_style")
-            self.assertEqual(command.argument, "{{watercolor}},\nsoft lighting")
-            self.assertEqual(parse_command(f"{prefix} \n ").argument, "")
-        self.assertIsNone(parse_command("NovelAI画风watercolor"))
+        for label, name in (("NovelAI画风", "novelai_style"), ("Nai v5 画风", "nai_v5_style")):
+            for prefix in (label, f"/{label}"):
+                command = parse_command(f" {prefix}  {{{{watercolor}}}},\nsoft lighting ")
+                self.assertEqual(command.name, name)
+                self.assertEqual(command.argument, "{{watercolor}},\nsoft lighting")
+                self.assertEqual(parse_command(f"{prefix} \n ").argument, "")
+            self.assertIsNone(parse_command(f"{label}watercolor"))
 
     def test_style_button_only_fills_input_without_clearing(self):
         buttons = [
@@ -52,13 +89,29 @@ class QQCommandsAndUITests(unittest.TestCase):
             for row in feature_menu_keyboard()["content"]["rows"]
             for button in row["buttons"]
         ]
-        style = next(button for button in buttons if button["id"] == "novelai_style")
-        self.assertEqual(style["action"]["data"], "NovelAI画风")
-        self.assertFalse(style["action"]["enter"])
+        for name, label in (("novelai_style", "NovelAI画风"), ("nai_v5_style", "Nai v5 画风")):
+            style = next(button for button in buttons if button["id"] == name)
+            self.assertEqual(style["action"]["data"], label)
+            self.assertFalse(style["action"]["enter"])
+        self.assertLessEqual(len(feature_menu_keyboard()["content"]["rows"]), 5)
 
     def test_quick_menu_can_include_full_reply_link(self):
         payload = quick_menu_keyboard(full_reply_url="https://public.example/reply/id")
         self.assertEqual(len(payload["content"]["rows"]), 2)
+
+    def test_quick_menu_can_include_generation_prompt_link(self):
+        prompt_url = "https://public.example/reply/prompt"
+        payload = quick_menu_keyboard(
+            full_reply_url="https://public.example/reply/full",
+            generation_prompt_url=prompt_url,
+        )
+        rows = payload["content"]["rows"]
+        self.assertEqual(len(rows), 3)
+        button = rows[-1]["buttons"][0]
+        self.assertEqual(button["id"], "view_generation_prompt")
+        self.assertEqual(button["render_data"]["label"], "查看本次提示词")
+        self.assertEqual(button["action"]["type"], 0)
+        self.assertEqual(button["action"]["data"], prompt_url)
 
     def test_novelai_options_include_generation_revision_and_full_reply_actions(self):
         prompts = ("first, safe, sfw", "second, safe, sfw", "third, safe, sfw")
@@ -81,6 +134,23 @@ class QQCommandsAndUITests(unittest.TestCase):
             rows[4]["buttons"][0]["action"]["data"],
             "https://public.example/reply/id",
         )
+
+    def test_image_link_uses_existing_url_action_with_full_output_and_prompt(self):
+        image_url = "https://public.example/media/image.png"
+        payload = quick_menu_keyboard(
+            full_reply_url="https://public.example/reply/full",
+            generation_prompt_url="https://public.example/reply/prompt?view=prompt",
+            image_url=image_url,
+        )
+        rows = payload["content"]["rows"]
+        self.assertEqual(len(rows), 4)
+        button = rows[-1]["buttons"][0]
+        self.assertEqual(button["id"], "view_image")
+        self.assertEqual(button["render_data"]["label"], "查看图片")
+        self.assertEqual(button["render_data"]["visited_label"], "查看图片")
+        self.assertEqual(button["action"], {
+            "type": 0, "permission": {"type": 2}, "data": image_url,
+        })
 
 
 if __name__ == "__main__":

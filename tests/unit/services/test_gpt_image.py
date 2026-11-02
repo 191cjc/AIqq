@@ -33,10 +33,10 @@ def encoded_png(size: tuple[int, int] = (20, 10)) -> str:
     return base64.b64encode(output.getvalue()).decode("ascii")
 
 
-def image_response() -> httpx.Response:
+def image_response(size: tuple[int, int] = (20, 10)) -> httpx.Response:
     return httpx.Response(
         200,
-        json={"created": 1, "data": [{"b64_json": encoded_png()}]},
+        json={"created": 1, "data": [{"b64_json": encoded_png(size)}]},
         headers={"x-request-id": "req-image-success"},
     )
 
@@ -95,7 +95,7 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
             reference_image=reference,
         )
 
-    async def test_generation_json_contract_and_jpeg_normalization(self):
+    async def test_generation_json_contract_and_original_image_bytes(self):
         service, requests = self.service(lambda _: image_response())
         with self.assertLogs(LOGGER, level="INFO") as captured:
             asset = await self.run_operation(service)
@@ -104,18 +104,19 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0].method, "POST")
         self.assertEqual(requests[0].url.path, "/v1/images/generations")
         self.assertEqual(json.loads(requests[0].content), {
-            "model": "gpt-image-2", "prompt": SAFE_IMAGE_INSTRUCTION + PROMPT,
-            "n": 1, "size": "1024x1024", "quality": "high",
-            "output_format": "jpeg", "output_compression": 85, "moderation": "auto",
+            "model": "gpt-image-2.5-flare", "prompt": SAFE_IMAGE_INSTRUCTION + PROMPT,
+            "n": 1, "size": "auto", "quality": "high", "moderation": "auto",
+            "response_format": "b64_json",
         })
-        self.assertEqual(asset.mime_type, "image/jpeg")
-        self.assertEqual((asset.width, asset.height), (1024, 1024))
+        self.assertEqual(asset.mime_type, "image/png")
+        self.assertEqual(asset.data, base64.b64decode(encoded_png()))
+        self.assertEqual((asset.width, asset.height), (20, 10))
         with Image.open(BytesIO(asset.data)) as decoded:
-            self.assertEqual(decoded.format, "JPEG")
-            self.assertEqual(decoded.mode, "RGB")
-            self.assertEqual(decoded.size, (1024, 1024))
-            self.assertEqual(decoded.getpixel((0, 0)), (255, 255, 255))
-            self.assertGreater(decoded.getpixel((512, 512))[0], 240)
+            self.assertEqual(decoded.format, "PNG")
+            self.assertEqual(decoded.mode, "RGBA")
+            self.assertEqual(decoded.size, (20, 10))
+            for point in ((0, 0), (19, 0), (0, 9), (19, 9), (10, 5)):
+                self.assertEqual(decoded.getpixel(point), (255, 0, 0, 128))
         started, finished = map(log_fields, captured.records)
         self.assertEqual(started["attempt_id"], finished["attempt_id"])
         self.assertEqual(finished["outcome"], "succeeded")
@@ -134,12 +135,11 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.method, "POST")
         self.assertEqual(request.url.path, "/v1/images/edits")
         parts = multipart_parts(request)
-        self.assertNotIn("response_format", parts)
         expected = {
-            "model": "gpt-image-2", "prompt": SAFE_IMAGE_INSTRUCTION + PROMPT,
-            "n": "1", "size": "1024x1024", "quality": "high",
-            "output_format": "jpeg", "output_compression": "85",
+            "model": "gpt-image-2.5-flare", "prompt": SAFE_IMAGE_INSTRUCTION + PROMPT,
+            "n": "1", "size": "auto", "quality": "high",
             "input_fidelity": "high",
+            "response_format": "b64_json",
         }
         self.assertEqual(set(parts), set(expected) | {"image"})
         for name, value in expected.items():
@@ -149,15 +149,12 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parts["image"].get_payload(decode=True), base64.b64decode(encoded_png()))
         self.assertEqual(log_fields(captured.records[-1])["operation"], "edit")
 
-    async def test_custom_dimensions_select_native_request_and_exact_output(self):
+    async def test_custom_dimensions_still_use_auto_and_accept_returned_size(self):
         for operation in ("generate", "edit"):
-            for dimensions, request_size in (
-                ((800, 800), "1024x1024"),
-                ((1080, 1920), "1024x1536"),
-                ((1920, 1080), "1536x1024"),
-            ):
+            for dimensions in ((800, 800), (1080, 1920), (1920, 1080)):
                 with self.subTest(operation=operation, dimensions=dimensions):
-                    service, requests = self.service(lambda _: image_response())
+                    returned_size = (20, 10)
+                    service, requests = self.service(lambda _: image_response(returned_size))
                     asset = await self.run_operation(
                         service, operation,
                         width=dimensions[0], height=dimensions[1],
@@ -169,10 +166,96 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
                         actual_size = multipart_parts(request)["size"].get_payload(
                             decode=True
                         ).decode()
-                    self.assertEqual(actual_size, request_size)
-                    self.assertEqual((asset.width, asset.height), dimensions)
+                    self.assertEqual(actual_size, "auto")
+                    self.assertEqual((asset.width, asset.height), returned_size)
+                    self.assertEqual(asset.data, base64.b64decode(encoded_png(returned_size)))
                     with Image.open(BytesIO(asset.data)) as decoded:
-                        self.assertEqual(decoded.size, dimensions)
+                        self.assertEqual(decoded.size, returned_size)
+
+    async def test_long_reference_edits_use_auto_and_accept_a_different_canvas(self):
+        for dimensions in ((1080, 5037), (5037, 1080), (1024, 1024)):
+            with self.subTest(dimensions=dimensions):
+                returned_size = (895, 1757)
+                service, requests = self.service(lambda _: image_response(returned_size))
+                reference = ImageAsset(base64.b64decode(encoded_png(dimensions)), "image/png", 1, 1)
+                with self.assertLogs(LOGGER, level="INFO") as logs:
+                    asset = await service.generate(
+                        ImageAction("edit", PROMPT, source_record_id=7),
+                        reference_image=reference,
+                    )
+                parts = multipart_parts(requests[0])
+                self.assertEqual(parts["size"].get_payload(decode=True), b"auto")
+                self.assertEqual(parts["image"].get_payload(decode=True), reference.data)
+                self.assertEqual((asset.width, asset.height), returned_size)
+                self.assertEqual(asset.data, base64.b64decode(encoded_png(returned_size)))
+                fields = log_fields(logs.records[-1])
+                self.assertEqual((fields["reference_width"], fields["reference_height"]), dimensions)
+                self.assertEqual((fields["output_width"], fields["output_height"]), returned_size)
+                self.assertEqual(fields["outcome"], "succeeded")
+
+    async def test_edit_forwards_reference_exif_bytes_unchanged_with_auto_size(self):
+        output = BytesIO()
+        with Image.new("RGB", (20, 10), "red") as source:
+            exif = Image.Exif()
+            exif[274] = 6
+            source.save(output, format="JPEG", exif=exif)
+        reference = ImageAsset(output.getvalue(), "image/jpeg", 20, 10)
+        service, requests = self.service(lambda _: image_response((10, 20)))
+        image = await service.generate(
+            ImageAction("edit", PROMPT, source_record_id=7),
+            reference_image=reference,
+        )
+        parts = multipart_parts(requests[0])
+        self.assertEqual(parts["size"].get_payload(decode=True), b"auto")
+        self.assertEqual(parts["image"].get_payload(decode=True), reference.data)
+        self.assertEqual((image.width, image.height), (10, 20))
+
+    async def test_png_jpeg_and_webp_results_retain_original_encoding_and_metadata(self):
+        for operation in ("generate", "edit"):
+            for image_format, mime_type in (
+                ("PNG", "image/png"), ("JPEG", "image/jpeg"), ("WEBP", "image/webp"),
+            ):
+                with self.subTest(operation=operation, image_format=image_format):
+                    output = BytesIO()
+                    exif = Image.Exif()
+                    exif[274] = 6
+                    mode = "RGB" if image_format == "JPEG" else "RGBA"
+                    with Image.new(mode, (120, 80), "red") as source:
+                        source.save(output, format=image_format, exif=exif)
+                    original = output.getvalue()
+                    service, requests = self.service(lambda _: httpx.Response(
+                        200, json={"data": [{"b64_json": base64.b64encode(original).decode()}]},
+                    ))
+                    asset = await self.run_operation(service, operation)
+                    self.assertEqual(asset.data, original)
+                    self.assertEqual(asset.mime_type, mime_type)
+                    self.assertEqual((asset.width, asset.height), (120, 80))
+                    self.assertEqual(len(requests), 1)
+
+    async def test_provider_request_errors_are_reported_without_fallback_or_retry(self):
+        for error in (
+            {"message": "The requested image size is invalid.", "type": "invalid_request_error"},
+            {"param": "size", "message": "private provider text " + API_KEY},
+        ):
+            with self.subTest(error=bool(error.get("param"))):
+                service, requests = self.service(lambda _: httpx.Response(400, json={"error": error}))
+                with self.assertLogs(LOGGER, level="INFO") as logs:
+                    with self.assertRaises(GPTImageError) as raised:
+                        await self.run_operation(service, "edit")
+                self.assertEqual(raised.exception.kind, "invalid_request")
+                self.assertEqual(len(requests), 1)
+                self.assertNotIn(API_KEY, " ".join(logs.output))
+
+    async def test_invalid_reference_bytes_fail_before_provider_request(self):
+        service, requests = self.service(lambda _: image_response())
+        with self.assertLogs(LOGGER, level="INFO"):
+            with self.assertRaises(GPTImageError) as raised:
+                await service.generate(
+                    ImageAction("edit", PROMPT, source_record_id=7),
+                    reference_image=ImageAsset(b"not an image", "image/png", 1080, 5037),
+                )
+        self.assertEqual(raised.exception.kind, "invalid_request")
+        self.assertEqual(requests, [])
 
     def test_native_size_selection_uses_symmetric_nearest_ratio(self):
         for dimensions, expected in (
@@ -182,14 +265,13 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
             ((1225, 1000), "1536x1024"),
         ):
             with self.subTest(dimensions=dimensions):
-                request_size, target_size = _resolve_image_size(
+                request_size = _resolve_image_size(
                     ImageAction(
                         "generate", PROMPT,
                         width=dimensions[0], height=dimensions[1],
                     )
                 )
                 self.assertEqual(request_size, expected)
-                self.assertEqual(target_size, dimensions)
 
     async def test_missing_reference_does_not_post(self):
         service, requests = self.service(lambda _: image_response())
@@ -247,8 +329,8 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
 
                     self.assertEqual(len(requests), retry_count + 1)
                     self.assertEqual(sleep.await_args_list, [call(0.5), call(1.0)][:retry_count])
-                    self.assertEqual(asset.mime_type, "image/jpeg")
-                    self.assertEqual((asset.width, asset.height), (1024, 1024))
+                    self.assertEqual(asset.mime_type, "image/png")
+                    self.assertEqual((asset.width, asset.height), (20, 10))
                     for request in requests:
                         self.assertEqual(request.method, "POST")
                         self.assertEqual(request.url, requests[0].url)
@@ -458,7 +540,7 @@ class GPTImageServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_current_model_group_error_and_top_level_error_are_diagnosable(self):
         body = {
-            "message": 'Model "gpt-image-2" is not supported by any configured account in this group',
+            "message": 'Model "gpt-image-2.5-flare" is not supported by any configured account in this group',
             "type": "model_not_found", "code": "model_not_found", "param": "model",
             "prompt": PROMPT, "image": encoded_png(),
         }

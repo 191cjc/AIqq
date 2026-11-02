@@ -9,7 +9,7 @@ from typing import Any, Literal, cast
 
 from aiqq.exceptions import NovelAITagSearchUnavailable
 from aiqq.logic.models import DanbooruTag
-from aiqq.services.images.novelai import NovelAIMCPTransport
+from aiqq.services.images.novelai import NAI_V5_MODEL, NovelAIMCPTransport
 from aiqq.services.novelai_tag_query import normalize_novelai_tag_query
 
 
@@ -46,6 +46,76 @@ class NovelAITagSearchService:
                 "event=novelai_tag_search_failed error_type=%s", type(exc).__name__
             )
             raise NovelAITagSearchUnavailable("Danbooru tag lookup failed") from exc
+
+
+class NaiV5TagSearchService:
+    """Adapt the V5 server's tagger records to the prompt agent's tag contract."""
+
+    def __init__(self, client: NovelAIMCPTransport | None) -> None:
+        self._client = client
+        self._semaphore = asyncio.Semaphore(3)
+
+    async def search(
+        self, query: str, *, limit: int = 8
+    ) -> tuple[DanbooruTag, ...]:
+        try:
+            normalized = normalize_novelai_tag_query(query)
+            if type(limit) is not int or not 1 <= limit <= 20:
+                raise ValueError("Tag search limit is invalid")
+            if self._client is None:
+                raise ValueError("Nai v5 tag search is not configured")
+            async with self._semaphore:
+                async with asyncio.timeout(TAG_SEARCH_TIMEOUT_SECONDS):
+                    response = await self._client.call_tool(
+                        "suggest_tags",
+                        {"prompt": normalized, "model": NAI_V5_MODEL, "language": "en"},
+                    )
+            return _parse_v5_response(response, limit=limit)
+        except Exception as exc:
+            logger.warning(
+                "event=nai_v5_tag_search_failed error_type=%s", type(exc).__name__
+            )
+            raise NovelAITagSearchUnavailable("Nai v5 tag lookup failed") from exc
+
+
+def _parse_v5_response(response: Any, *, limit: int) -> tuple[DanbooruTag, ...]:
+    if not isinstance(response, dict):
+        raise ValueError("Tag search response must be an object")
+    _reject_error(response)
+    if "structuredContent" in response:
+        structured = response["structuredContent"]
+        if isinstance(structured, dict):
+            _reject_error(structured)
+            structured = structured.get("result")
+        records = _record_list(structured)
+    else:
+        records = _text_records(response.get("content"))
+
+    candidates: dict[str, DanbooruTag] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("Tag search record must be an object")
+        _reject_error(record)
+        tag = record.get("tag", record.get("text"))
+        count = record.get("count")
+        if (
+            not isinstance(tag, str)
+            or not 1 <= len(tag) <= 120
+            or not tag.isascii()
+            or not tag.isprintable()
+            or tag != tag.strip()
+            or "," in tag
+            or type(count) is not int
+            or count < 0
+        ):
+            raise ValueError("Tag search record is invalid")
+        candidate = DanbooruTag(tag, "general", count)
+        previous = candidates.get(tag)
+        if previous is None or previous.post_count < count:
+            candidates[tag] = candidate
+    return tuple(
+        sorted(candidates.values(), key=lambda item: (-item.post_count, item.tag))[:limit]
+    )
 
 
 def _parse_response(response: Any, *, limit: int) -> tuple[DanbooruTag, ...]:

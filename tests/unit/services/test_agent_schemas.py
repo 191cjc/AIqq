@@ -35,10 +35,21 @@ class AgentSchemaTests(unittest.TestCase):
         )
         self.assertTrue(allowed.allowed)
 
-        with self.assertRaises(InvalidAgentOutput):
-            parse_prompt_audit_output(
-                '{"allowed":false,"category":"safe","reason":"no"}'
-            )
+        for category in ("adult_content", "persona_override", "too_complex"):
+            with self.subTest(category=category):
+                rejected = parse_prompt_audit_output(json.dumps({
+                    "allowed": False, "category": category, "reason": "拒绝原因",
+                }))
+                self.assertFalse(rejected.allowed)
+                self.assertEqual(rejected.category, category)
+
+        for output in (
+            '{"allowed":false,"category":"safe","reason":"no"}',
+            '{"allowed":false,"category":"too_many_questions","reason":"no"}',
+            '{"allowed":false,"category":"complex_research","reason":"no"}',
+        ):
+            with self.subTest(output=output), self.assertRaises(InvalidAgentOutput):
+                parse_prompt_audit_output(output)
 
     def test_chat_rejects_free_text_old_markers_and_extra_fields(self):
         for value in (
@@ -49,7 +60,7 @@ class AgentSchemaTests(unittest.TestCase):
                     "full_text": "answer",
                     "summary": "summary",
                     "image_action": None,
-                    "selected_web_image_url": None,
+                    "selected_web_image_urls": [],
                     "sources": [],
                     "legacy": True,
                 }
@@ -69,7 +80,7 @@ class AgentSchemaTests(unittest.TestCase):
                 "width": None,
                 "height": None,
             },
-            "selected_web_image_url": "https://images.example.com/a.jpg",
+            "selected_web_image_urls": ["https://images.example.com/a.jpg"],
             "sources": [
                 {"title": "source", "url": "https://www.example.com/article"}
             ],
@@ -88,7 +99,7 @@ class AgentSchemaTests(unittest.TestCase):
 
         with self.assertRaises(InvalidAgentOutput):
             parse_chat_agent_output(json.dumps(base))
-        base["selected_web_image_url"] = "https://127.0.0.1/private.jpg"
+        base["selected_web_image_urls"] = ["https://127.0.0.1/private.jpg"]
         with self.assertRaises(InvalidAgentOutput):
             parse_chat_agent_output(
                 json.dumps(base), allowed_image_record_ids=frozenset({7})
@@ -105,7 +116,7 @@ class AgentSchemaTests(unittest.TestCase):
                 "width": None,
                 "height": None,
             },
-            "selected_web_image_url": None,
+            "selected_web_image_urls": [],
             "sources": [],
         }
         for width, height in (
@@ -139,12 +150,51 @@ class AgentSchemaTests(unittest.TestCase):
         self.assertIn("width", action_schema["required"])
         self.assertIn("height", action_schema["required"])
 
+    def test_chat_web_image_selections_are_ordered_distinct_and_bounded(self):
+        base = {
+            "full_text": "找到所需图片。",
+            "summary": "找到所需图片。",
+            "image_action": None,
+            "selected_web_image_urls": [],
+            "sources": [],
+        }
+        urls = [f"https://images.example.com/{index}.jpg" for index in range(6)]
+        for count in (0, 1, 3, 5):
+            with self.subTest(count=count):
+                parsed = parse_chat_agent_output(json.dumps({
+                    **base, "selected_web_image_urls": urls[:count],
+                }))
+                self.assertEqual(parsed.selected_web_image_urls, tuple(urls[:count]))
+
+        parsed = parse_chat_agent_output(json.dumps({
+            **base, "selected_web_image_urls": [urls[2], urls[0], urls[2]],
+        }))
+        self.assertEqual(parsed.selected_web_image_urls, (urls[2], urls[0]))
+        for value in (
+            urls, None, urls[0], [False], ["http://images.example.com/a.jpg"],
+            [urls[0], "https://127.0.0.1/private.jpg"],
+            ["https://user:secret@images.example.com/a.jpg"],
+        ):
+            with self.subTest(value=value), self.assertRaises(InvalidAgentOutput):
+                parse_chat_agent_output(json.dumps({
+                    **base, "selected_web_image_urls": value,
+                }))
+        with self.assertRaises(InvalidAgentOutput):
+            parse_chat_agent_output(json.dumps({
+                key: value for key, value in base.items()
+                if key != "selected_web_image_urls"
+            }))
+        self.assertEqual(
+            CHAT_AGENT_OUTPUT_SCHEMA["properties"]["selected_web_image_urls"]["maxItems"],
+            5,
+        )
+
     def test_chat_rejects_markdown_summary(self):
         value = {
             "full_text": "完整回答",
             "summary": "[查看](https://example.com)",
             "image_action": None,
-            "selected_web_image_url": None,
+            "selected_web_image_urls": [],
             "sources": [],
         }
         with self.assertRaises(InvalidAgentOutput):

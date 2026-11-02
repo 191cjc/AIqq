@@ -39,6 +39,10 @@ class FakeRepository:
     async def is_owned_bot_message(self, **kwargs):
         return self.owned
 
+    async def mark_member_recalled(self, **kwargs):
+        self.recalled.append(kwargs)
+        return True
+
     async def mark_recalled(self, **kwargs):
         self.recalled.append(kwargs)
         return True
@@ -463,6 +467,67 @@ class QQMessageSenderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repository.saved[0]["source_message_id"], "")
         self.assertEqual(repository.saved[0]["payload"]["origin"], "console")
         self.assertNotIn("msg_seq", repository.saved[0]["payload"])
+
+    async def test_member_recall_uses_incoming_id_and_records_only_api_success(self):
+        api = FakeApi()
+        repository = FakeRepository()
+        repository.owned = False
+        sender = QQMessageSender(api, repository, bot_username="AiQQ")
+        status = await sender.recall_member_message(group_id="group", message_id="member-request")
+        self.assertEqual(status, "recalled")
+        self.assertEqual(len(api._http.routes), 1)
+        route = api._http.routes[0]
+        self.assertEqual(route.method, "DELETE")
+        self.assertIn("/v2/groups/group/messages/member-request", route.url)
+        self.assertEqual(repository.recalled[0]["message_id"], "member-request")
+
+    async def test_member_recall_classifies_actual_sdk_errors_without_false_confirmation(self):
+        for code, expected in (
+            (40062003, "permission_denied"), (40064004, "expired"),
+            (40061001, "failed"), (50065001, "failed"),
+        ):
+            with self.subTest(code=code):
+                api, repository = FakeApi(), FakeRepository()
+
+                async def reject(route):
+                    return await _handle_response(SimpleNamespace(
+                        status=400, request_info=SimpleNamespace(url=route.url),
+                        headers={"content-type": "application/json"},
+                        json=AsyncMock(return_value={
+                            "code": code,
+                            "message": {
+                                40062003: "无操作权限", 40064004: "已超出消息撤回时限",
+                            }.get(code, "消息撤回失败，请稍后重试"),
+                        }),
+                    ))
+
+                api._http.request = reject
+                sender = QQMessageSender(api, repository, bot_username="AiQQ")
+                with self.assertLogs("aiqq.services.qq.sender") as logs:
+                    status = await sender.recall_member_message(group_id="group", message_id="request")
+                self.assertEqual(status, expected)
+                self.assertEqual(repository.recalled, [])
+                self.assertNotIn("private prompt", "\n".join(logs.output))
+
+    async def test_member_recall_remains_confirmed_if_local_recording_fails(self):
+        api, repository = FakeApi(), FakeRepository()
+        repository.mark_member_recalled = AsyncMock(side_effect=OSError("private path"))
+        sender = QQMessageSender(api, repository, bot_username="AiQQ")
+        with self.assertLogs("aiqq.services.qq.sender") as logs:
+            status = await sender.recall_member_message(group_id="group", message_id="request")
+        self.assertEqual(status, "recalled")
+        self.assertEqual(len(api._http.routes), 1)
+        self.assertNotIn("private path", "\n".join(logs.output))
+
+    async def test_member_recall_propagates_cancellation_and_skips_empty_ids(self):
+        api, repository = FakeApi(), FakeRepository()
+        sender = QQMessageSender(api, repository, bot_username="AiQQ")
+        self.assertEqual(await sender.recall_member_message(group_id="", message_id="request"), "failed")
+        self.assertEqual(api._http.routes, [])
+        api._http.request = AsyncMock(side_effect=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await sender.recall_member_message(group_id="group", message_id="request")
+        self.assertEqual(repository.recalled, [])
 
     async def test_progress_send_is_recorded_and_can_be_recalled(self):
         api = FakeApi()

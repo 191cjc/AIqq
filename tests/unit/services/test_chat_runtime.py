@@ -40,7 +40,7 @@ class ReadSession:
         self.history_calls.append(filters)
         return {"status": "ok", "messages": [{"record_id": 4, "unknown": {"false": False}}],
                 "next_cursor": 4, "next_version_cursor": 8, "next_event_cursor": 12,
-                "has_more": True, "has_more_versions": False, "has_more_events": True,
+                "has_more": True, "versions_has_more": False, "events_has_more": True,
                 "pages_read": 1, "pages_remaining": 2}
 
     async def read_image(self, record_id, attachment_index=0, version_id=None):
@@ -71,10 +71,11 @@ class ChatRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     history = await client.post(bridge.url + "/history", json={"limit": 1}, headers=headers)
                     history.raise_for_status()
                     self.assertEqual(history.json(), {
-                        "status": "ok", "full_records_delivery": "model_context", "page_number": 1,
+                        "status": "ok", "history_delivery": "model_context", "page_number": 1,
+                        "new_page_staged": True,
                         "message_count": 1, "next_cursor": 4, "next_version_cursor": 8,
-                        "next_event_cursor": 12, "has_more": True, "has_more_versions": False,
-                        "has_more_events": True, "pages_read": 1, "pages_remaining": 2,
+                        "next_event_cursor": 12, "has_more": True, "versions_has_more": False,
+                        "events_has_more": True, "pages_read": 1, "pages_remaining": 2,
                     })
                     result = await client.post(bridge.url + "/image", json={"record_id": 4}, headers=headers)
                     result.raise_for_status()
@@ -105,6 +106,103 @@ class ChatRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result.status_code, 400)
                 self.assertFalse(list(outside.iterdir()))
 
+    async def test_history_pages_are_forwarded_once_and_output_cap_only_lowers(self):
+        forwarded = []
+
+        class PagingSession(ReadSession):
+            async def read_history(self, **filters):
+                self.history_calls.append(filters)
+                second_page = filters.get("before_record_id") == 4
+                record_id = 3 if second_page else 4
+                page_number = 2 if second_page else 1
+                return {
+                    "status": "ok",
+                    "messages": [{"record_id": record_id}],
+                    "has_more": not second_page,
+                    "next_cursor": record_id if not second_page else None,
+                    "pages_read": page_number,
+                    "pages_remaining": 3 - page_number,
+                }
+
+        async def endpoint(request):
+            forwarded.append(await request.json())
+            return web.json_response({"ok": True})
+
+        app = web.Application()
+        app.router.add_post("/responses", endpoint)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                work, runtime = Path(root, "work"), Path(root, "runtime")
+                work.mkdir()
+                runtime.mkdir()
+                async with ChatRuntime(
+                    session=PagingSession(),
+                    work=work,
+                    runtime=runtime,
+                    cli="/usr/bin/true",
+                    api_key="provider-secret",
+                    base_url=f"http://127.0.0.1:{port}",
+                    model="model",
+                    max_output_tokens=321,
+                ) as bridge:
+                    async with httpx.AsyncClient(trust_env=False) as client:
+                        read_headers = {"Authorization": "Bearer " + bridge.read_token}
+                        first = await client.post(
+                            bridge.url + "/history", json={}, headers=read_headers
+                        )
+                        repeated = await client.post(
+                            bridge.url + "/history", json={"limit": 50},
+                            headers=read_headers,
+                        )
+                        self.assertTrue(first.json()["new_page_staged"])
+                        self.assertFalse(repeated.json()["new_page_staged"])
+                        model_headers = {
+                            "Authorization": "Bearer " + bridge.model_token
+                        }
+                        for limit in (100, None):
+                            body = {"model": "model", "input": []}
+                            if limit is not None:
+                                body["max_output_tokens"] = limit
+                            response = await client.post(
+                                bridge.url + "/v1/responses",
+                                json=body,
+                                headers=model_headers,
+                            )
+                            response.raise_for_status()
+                            if limit == 100:
+                                second = await client.post(
+                                    bridge.url + "/history",
+                                    json={"before_record_id": 4},
+                                    headers=read_headers,
+                                )
+                                self.assertTrue(second.json()["new_page_staged"])
+                        response = await client.post(
+                            bridge.url + "/v1/responses",
+                            json={"model": "model", "input": []},
+                            headers=model_headers,
+                        )
+                        response.raise_for_status()
+        finally:
+            await runner.cleanup()
+
+        self.assertEqual(forwarded[0]["max_output_tokens"], 100)
+        self.assertEqual(forwarded[1]["max_output_tokens"], 321)
+        self.assertEqual(forwarded[2]["max_output_tokens"], 321)
+        first_context = json.loads(
+            forwarded[0]["input"][-1]["content"][0]["text"]
+        )["untrusted_chat_read_results"]
+        second_context = json.loads(
+            forwarded[1]["input"][-1]["content"][0]["text"]
+        )["untrusted_chat_read_results"]
+        self.assertEqual(first_context[0]["messages"], [{"record_id": 4}])
+        self.assertEqual(second_context[0]["messages"], [{"record_id": 3}])
+        self.assertNotIn("untrusted_chat_read_results", json.dumps(forwarded[2]))
+
     async def test_cancel_closes_inflight_read_and_removes_temporary_images(self):
         entered, finished = asyncio.Event(), asyncio.Event()
         class WaitingSession(ReadSession):
@@ -128,7 +226,7 @@ class ChatRuntimeTests(unittest.IsolatedAsyncioTestCase):
             backend = CodexSDKBackend(api_key="secret", base_url="https://unused.invalid", model="model",
                 cli_path="/usr/bin/true", runtime_dir=Path(root, "runtime"), work_dir=Path(root, "work"),
                 codex_factory=FakeCodex)
-            run = asyncio.create_task(backend.run(instructions="chat", model_input="read", output_schema=SCHEMA,
+            run = asyncio.create_task(backend.run(purpose="chat", instructions="chat", model_input="read", output_schema=SCHEMA,
                 input_images=(_image(),), chat_read_session=WaitingSession()))
             await asyncio.wait_for(entered.wait(), 3)
             run.cancel()
@@ -144,9 +242,13 @@ class ChatRuntimeTests(unittest.IsolatedAsyncioTestCase):
         cli = find_codex_cli()
         if "codex-linux" not in cli:
             self.skipTest("packaged Codex CLI not installed")
-        page = {"status": "ok", "messages": [{"record_id": 4, "payload": {
-            "content": "完整正文\n" * 6000, "unknown_tail": {"null": None, "false": False, "zero": 0}}}],
-            "has_more": False, "records_complete": True}
+        page = {"status": "ok", "messages": [{
+            "record_id": 4, "role": "user", "sender_name": "member",
+            "sent_at": "2026-09-16T00:00:00Z", "content": "完整正文\n" * 6000,
+            "message_type": 0, "reply_summary": "", "has_image": True,
+            "image_attachment_indexes": [0], "recall_state": "unobserved",
+            "progress": False,
+        }], "has_more": False, "records_complete": False, "pages_read": 1}
         class NativeSession(ReadSession):
             async def read_history(self, **filters):
                 self.history_calls.append(filters)
@@ -165,6 +267,7 @@ class ChatRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 requests.append(payload)
                 number = len(requests)
                 self.assertEqual(request.headers["Authorization"], "Bearer real-secret")
+                self.assertEqual(payload["max_output_tokens"], 1000)
                 if number == 1:
                     permission_code = f'''
 import json,os
@@ -238,7 +341,7 @@ Path("permissions.json").write_text(json.dumps(result))
             original_umask = os.umask(0o077)
             try:
                 async with asyncio.timeout(30):
-                    result = await backend.run(instructions="Read requested images and return JSON.", model_input="Read record 4",
+                    result = await backend.run(purpose="chat", instructions="Read requested images and return JSON.", model_input="Read record 4",
                         output_schema=SCHEMA, chat_read_session=session)
             finally:
                 observed_parent_umask = os.umask(original_umask)
@@ -252,11 +355,14 @@ Path("permissions.json").write_text(json.dumps(result))
             self.assertEqual(result.text, '{"ok":true}')
             self.assertEqual(session.image_calls, [(4, 0, None)])
             self.assertEqual(session.history_calls, [{"limit": 50}])
-            for request in requests[1:]:
-                full_context = json.loads(request["input"][-1]["content"][0]["text"])
-                self.assertEqual(full_context["untrusted_chat_read_results"], [page])
-            # The large original page is injected intact outside shell stdout.
-            self.assertGreater(len(page["messages"][0]["payload"]["content"]), 10000)
+            full_context = json.loads(requests[1]["input"][-1]["content"][0]["text"])
+            self.assertEqual(full_context["untrusted_chat_read_results"], [page])
+            for request in requests[2:]:
+                self.assertEqual(
+                    json.dumps(request).count("untrusted_chat_read_results"), 1
+                )
+            # The compact page is injected intact outside shell stdout.
+            self.assertGreater(len(page["messages"][0]["content"]), 10000)
             self.assertEqual(len(requests), 4)
             self.assertTrue(background_pids)
             self.assertTrue(all(not Path(f"/proc/{pid}").exists() for pid in background_pids))
@@ -343,7 +449,7 @@ print(json.dumps(results))
         self.assertEqual(set(tools), {"read_history", "read_image"})
         history_fields = {"record_id", "before_record_id", "message_id", "limit", "sender",
                           "keyword", "sent_after", "sent_before", "versions", "before_version_id",
-                          "events", "before_event_record_id"}
+                          "events", "before_event_record_id", "raw"}
         self.assertEqual(set(tools["read_history"]["parameters"]["properties"]), history_fields)
         for tool in tools.values():
             self.assertTrue(tool["strict"])
@@ -363,13 +469,18 @@ print(json.dumps(results))
                 return SimpleNamespace(output_text='{"ok":true}', output=[], usage=None)
         backend = ResponsesBackend(api_key="", base_url="https://unused.invalid", model="model",
                                    client=SimpleNamespace(responses=Responses()))
-        result = await backend.run(instructions="chat", model_input="complete records", output_schema=SCHEMA, chat_read_session=ReadSession())
+        with self.assertLogs("aiqq.services.ai.turn_metrics", level="INFO") as logs:
+            result = await backend.run(purpose="chat", instructions="chat", model_input="complete records", output_schema=SCHEMA, chat_read_session=ReadSession())
         self.assertEqual(result.text, '{"ok":true}')
         self.assertEqual(len(requests), 2)
         self.assertEqual(requests[1]["input"][0]["content"], "complete records")
         pixels = [part for item in requests[1]["input"] for part in item.get("content", []) if isinstance(part, dict) and part.get("type") == "input_image"]
         self.assertEqual(len(pixels), 2)
         self.assertNotIn("previous_response_id", requests[1])
+        self.assertIn("provider_requests=2", logs.output[0])
+        self.assertIn("tool_calls=1", logs.output[0])
+        self.assertIn("history_pages=0", logs.output[0])
+        self.assertIn("image_reads=1", logs.output[0])
 
 
 class BackendFailureTests(unittest.IsolatedAsyncioTestCase):
@@ -385,7 +496,7 @@ class BackendFailureTests(unittest.IsolatedAsyncioTestCase):
         backend = ResponsesBackend(api_key="", base_url="https://unused.invalid", model="model",
             client=SimpleNamespace(responses=Responses()))
         with self.assertRaises(AgentUnavailable):
-            await backend.run(instructions="chat", model_input="history", output_schema=SCHEMA, chat_read_session=ReadSession())
+            await backend.run(purpose="chat", instructions="chat", model_input="history", output_schema=SCHEMA, chat_read_session=ReadSession())
         self.assertEqual(len(requests), MAX_TOOL_ROUNDS + 1)
 
     async def test_responses_context_error_is_preserved(self):
@@ -398,7 +509,7 @@ class BackendFailureTests(unittest.IsolatedAsyncioTestCase):
         backend = ResponsesBackend(api_key="", base_url="https://unused.invalid", model="model",
             client=SimpleNamespace(responses=Responses()))
         with self.assertRaises(AgentContextTooLarge):
-            await backend.run(instructions="chat", model_input="history", output_schema=SCHEMA)
+            await backend.run(purpose="chat", instructions="chat", model_input="history", output_schema=SCHEMA)
 
     async def test_codex_context_error_is_preserved(self):
         from aiqq.exceptions import AgentContextTooLarge

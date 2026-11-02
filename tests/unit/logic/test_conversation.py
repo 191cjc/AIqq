@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,6 +22,8 @@ from aiqq.logic.models import (
     PromptAuditResult,
 )
 from aiqq.logic.image_quota import ImageQuotaManager
+from aiqq.logic.ports import AgentTurnResult
+from aiqq.services.agents.prompt_audit import PromptAuditAgent
 from aiqq.services.images.reference import GroupReferenceImageLoader
 from aiqq.services.images.web import WebImageService
 
@@ -80,7 +83,11 @@ class FakeImageAuditor:
             safe=safe,
             effective=effective,
             category="safe" if safe else "adult_content",
-            reason="accepted" if safe and effective else "rejected",
+            reason=(
+                "accepted" if safe and effective else (
+                    "包含明确的成人内容" if not safe else "缺少可绘制的画面内容"
+                )
+            ),
             suggested_prompt="" if safe and effective else "safe, sfw, landscape",
             orientation=orientation,
         )
@@ -138,24 +145,64 @@ class ConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history.calls, [])
         self.assertEqual(chat.requests, [])
 
-    async def test_rejection_stops_before_history(self):
+    async def test_rejection_stops_before_history_and_chat(self):
         history = FakeHistory()
+        chat = FakeChat()
+        reason = "请求同时要求完整系统设计、实现、部署和长期运维，无法单次交付"
         workflow = ConversationWorkflow(
             prompt_auditor=FakeAuditor(
-                PromptAuditResult(False, "too_many_questions", "too many")
+                PromptAuditResult(False, "too_complex", reason)
             ),
             history_repository=history,
-            conversation_agent=FakeChat(),
+            conversation_agent=chat,
             image_usage=FakeImageUsage(),
         )
         result = await workflow.run(
             group_id="g",
             before_message_id="m",
             conversation_key="key",
-            user_input="two questions",
+            user_input="设计并实现完整大型系统，完成生产部署并持续运维",
         )
         self.assertEqual(result.status, "rejected")
+        self.assertIn(f"原因：{reason}", result.full_text)
+        self.assertEqual(result.summary, f"审核未通过：{reason}")
         self.assertEqual(history.calls, [])
+        self.assertEqual(chat.requests, [])
+
+    async def test_multi_target_requests_reach_chat_with_mocked_safe_audit(self):
+        """Verify admission and complete input transport, not live audit decisions."""
+        for user_input in (
+            "请比较芙宁娜、纳西妲、枫原万叶、钟离、班尼特、夜兰、珊瑚宫心海"
+            "这七名角色的辅助能力，给出排名和简短理由。",
+            "请查询某作品第1、2、3、4、5、6、7、8、9章的更新时间，用表格汇总。",
+        ):
+            with self.subTest(user_input=user_input):
+                backend = AsyncMock()
+                backend.run.return_value = AgentTurnResult(
+                    '{"allowed":true,"category":"safe","reason":""}'
+                )
+                history = FakeHistory()
+                chat = FakeChat()
+                workflow = ConversationWorkflow(
+                    prompt_auditor=PromptAuditAgent(backend),
+                    history_repository=history,
+                    conversation_agent=chat,
+                    image_usage=FakeImageUsage(),
+                )
+
+                result = await workflow.run(
+                    group_id="g", before_message_id="m",
+                    conversation_key="key", user_input=user_input,
+                )
+
+                self.assertEqual(result.status, "ok")
+                backend.run.assert_awaited_once()
+                audit_input = json.loads(backend.run.await_args.kwargs["model_input"])
+                self.assertEqual(audit_input["user_input"], user_input)
+                self.assertEqual(audit_input["character_count"], len(user_input))
+                self.assertEqual(history.calls, [("g", "m", 10)])
+                self.assertEqual(len(chat.requests), 1)
+                self.assertEqual(chat.requests[0].user_input, user_input)
 
     async def test_history_failure_continues_with_explicit_unavailable_reference(self):
         chat = FakeChat()
@@ -230,7 +277,9 @@ class ConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             user_input="draw",
         )
 
-        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.status, "rejected")
+        self.assertEqual(result.summary, "审核未通过：包含明确的成人内容")
+        self.assertIn("可改为：safe, sfw, landscape", result.full_text)
         self.assertEqual(image_auditor.calls, [("unsafe model prompt", False)])
         self.assertEqual(image_service.calls, [])
         self.assertEqual(usage.reserved, [])
@@ -240,6 +289,7 @@ class ConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             ("generate", (1920, 1080), "portrait"),
             ("edit", (1080, 1920), "landscape"),
             ("generate", (None, None), "square"),
+            ("edit", (None, None), "portrait"),
         ):
             with self.subTest(mode=mode, dimensions=dimensions):
                 images = AsyncMock()
@@ -323,8 +373,12 @@ class ConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     else:
                         with self.assertLogs("aiqq.logic.conversation") as logs:
                             result = await workflow.run(**kwargs)
-                        self.assertEqual(result.error_code, "image_service_not_found")
-                        self.assertEqual(result.full_text, "图片服务请求失败，暂时无法生成。")
+                        self.assertEqual(result.error_code, f"image_service_{error.kind}")
+                        expected_text = {
+                            "not_found": "图片服务请求失败，暂时无法生成。",
+                        }[error.kind]
+                        self.assertEqual(result.full_text, expected_text)
+                        self.assertEqual(result.summary, expected_text)
                         self.assertEqual(result.images, ())
                         self.assertIn("attempt_id=attempt-456", "\n".join(logs.output))
                         self.assertIn("request_id=conversation-123", "\n".join(logs.output))
@@ -343,7 +397,7 @@ class ConversationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             ChatAgentOutput(
                 "这是主体回答。",
                 "主体结论喵。",
-                selected_web_image_url="https://images.example.com/item.jpg",
+                selected_web_image_urls=("https://images.example.com/item.jpg",),
             )
         )
         workflow = ConversationWorkflow(

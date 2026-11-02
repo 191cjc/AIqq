@@ -24,9 +24,23 @@ class FakeReplySender:
     def __init__(self):
         self.calls = []
         self.start_calls = []
+        self.translation_calls = []
+        self.translation_error = None
+        self.receipt_calls = []
+        self.receipt_error = None
+
+    async def acknowledge_image_request(self, **kwargs):
+        self.receipt_calls.append(kwargs)
+        if self.receipt_error:
+            raise self.receipt_error
 
     async def send_image_start(self, **kwargs):
         self.start_calls.append(kwargs)
+
+    async def send_novelai_translation_start(self, **kwargs):
+        self.translation_calls.append(kwargs)
+        if self.translation_error:
+            raise self.translation_error
 
     async def send(self, result, **kwargs):
         self.calls.append((result, kwargs))
@@ -36,9 +50,11 @@ class FakeImageWorkflow:
     def __init__(self, label):
         self.label = label
         self.calls = []
+        self.members = []
 
-    async def run(self, prompt, *, conversation_key, on_image_start=None):
+    async def run(self, prompt, *, conversation_key, member_openid="", on_image_start=None):
         self.calls.append((prompt, conversation_key))
+        self.members.append(member_openid)
         return ConversationResult("ok", self.label, self.label)
 
 
@@ -129,9 +145,10 @@ class CommandRouterTests(unittest.IsolatedAsyncioTestCase):
 
         key = "group:group:member:member"
         self.assertEqual(self.gpt.calls, [("cat", key)])
+        self.assertEqual(self.gpt.members, ["member"])
         self.assertEqual(self.novelai.calls, [("white cat", key, "member")])
 
-    async def test_quick_image_uses_scoped_ids_and_sends_only_final_result(self):
+    async def test_quick_image_uses_scoped_ids_and_one_receipt_before_final_result(self):
         handled = await self.router.handle(
             ParsedCommand("novelai_quick_image", "白猫\n窗边"),
             self.message,
@@ -143,15 +160,112 @@ class CommandRouterTests(unittest.IsolatedAsyncioTestCase):
             self.quick.calls,
             [("白猫\n窗边", "group:group:member:member", "member")],
         )
-        self.assertEqual(len(self.replies.start_calls), 1)
-        self.assertEqual(self.replies.start_calls[0]["msg_seq"], 4)
+        self.assertEqual(self.replies.start_calls, [])
+        self.assertEqual(len(self.replies.receipt_calls), 1)
+        self.assertEqual(self.replies.receipt_calls[0]["msg_seq"], 4)
+        self.assertEqual(self.replies.translation_calls, [])
         self.assertEqual(len(self.replies.calls), 1)
         result, context = self.replies.calls[0]
         self.assertEqual(result.full_text, "quick")
         self.assertEqual(context["first_msg_seq"], 5)
         self.assertIsNone(context["keyboard_factory"])
+        self.assertTrue(context["show_generation_prompt"])
         self.assertEqual(self.prompts.calls, [])
         self.assertEqual(self.novelai.calls, [])
+
+    async def test_chinese_novelai_image_uses_quick_generation(self):
+        original_run = self.quick.run
+
+        async def run_after_notice(*args, **kwargs):
+            self.assertEqual(len(self.replies.receipt_calls), len(self.quick.calls) + 1)
+            return await original_run(*args, **kwargs)
+
+        self.quick.run = run_after_notice
+        for description in ("窗边的白猫", "white cat, 坐在窗边"):
+            command = parse_command(f"/NovelAI生图 {description}")
+            self.assertIsNotNone(command)
+            self.assertTrue(await self.router.handle(
+                command, self.message, first_msg_seq=4
+            ))
+
+        key = "group:group:member:member"
+        self.assertEqual(
+            self.quick.calls,
+            [("窗边的白猫", key, "member"), ("white cat, 坐在窗边", key, "member")],
+        )
+        self.assertEqual(self.novelai.calls, [])
+        self.assertEqual(self.prompts.calls, [])
+        self.assertEqual(self.replies.translation_calls, [])
+        self.assertEqual(len(self.replies.receipt_calls), 2)
+        self.assertTrue(all(
+            call["msg_seq"] == 4 for call in self.replies.receipt_calls
+        ))
+        self.assertEqual(self.replies.start_calls, [])
+        self.assertTrue(all(call["translate_prompt"] for call in self.replies.receipt_calls))
+        for result, context in self.replies.calls:
+            self.assertEqual(result.full_text, "quick")
+            self.assertEqual(context["first_msg_seq"], 5)
+            self.assertIsNone(context["keyboard_factory"])
+            self.assertTrue(context["show_generation_prompt"])
+
+    async def test_failed_receipt_still_generates_with_reserved_sequence(self):
+        self.replies.receipt_error = RuntimeError("QQ unavailable")
+
+        with self.assertLogs("aiqq.interfaces.qq.command_router", "WARNING") as logs:
+            handled = await self.router.handle(
+                ParsedCommand("novelai_image", "白猫"),
+                self.message, first_msg_seq=1,
+            )
+
+        self.assertTrue(handled)
+        self.assertIn("event=image_request_acknowledgement_failed", logs.output[0])
+        self.assertEqual(self.replies.start_calls, [])
+        self.assertEqual(self.replies.receipt_calls[0]["msg_seq"], 1)
+        self.assertEqual(self.replies.calls[0][1]["first_msg_seq"], 2)
+        self.assertTrue(self.replies.calls[0][1]["show_generation_prompt"])
+        self.assertEqual(len(self.quick.calls), 1)
+
+    async def test_failed_chinese_authoring_still_has_one_receipt(self):
+        self.quick.run = AsyncMock(return_value=ConversationResult(
+            "unavailable", "提示词服务不可用", "提示词服务不可用",
+            error_code="novelai_prompt_unavailable",
+        ))
+
+        handled = await self.router.handle(
+            ParsedCommand("novelai_image", "白猫"),
+            self.message, first_msg_seq=2,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(self.replies.receipt_calls[0]["msg_seq"], 2)
+        self.assertTrue(self.replies.receipt_calls[0]["translate_prompt"])
+        self.assertEqual(self.replies.translation_calls, [])
+        self.assertEqual(self.replies.start_calls, [])
+        self.assertEqual(self.replies.calls[0][1]["first_msg_seq"], 3)
+
+    async def test_novelai_image_without_chinese_keeps_direct_generation(self):
+        for description in ("white cat", "white cat，running", "white cat 🐈", ""):
+            self.assertTrue(await self.router.handle(
+                ParsedCommand("novelai_image", description),
+                self.message,
+                first_msg_seq=1,
+            ))
+
+        key = "group:group:member:member"
+        self.assertEqual(self.novelai.calls, [
+            ("white cat", key, "member"),
+            ("white cat，running", key, "member"),
+            ("white cat 🐈", key, "member"),
+            ("", key, "member"),
+        ])
+        self.assertEqual(self.quick.calls, [])
+        self.assertEqual(len(self.replies.receipt_calls), 3)
+        self.assertFalse(any(call["translate_prompt"] for call in self.replies.receipt_calls))
+        self.assertEqual(self.replies.translation_calls, [])
+        self.assertTrue(all(
+            context["show_generation_prompt"]
+            for _, context in self.replies.calls
+        ))
 
     async def test_style_save_and_clear_use_sender_and_send_acknowledgement(self):
         for argument in ("watercolor, soft lighting", ""):
@@ -240,9 +354,10 @@ class CommandRouterTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(usage.reserve_attempt.await_count, 4)
                 self.assertEqual(usage.record_success.await_count, 4)
-                self.assertEqual(len(self.replies.start_calls), 4)
+                self.assertEqual(self.replies.start_calls, [])
+                self.assertEqual(len(self.replies.receipt_calls), 4)
                 self.assertTrue(all(
-                    call["msg_seq"] == 1 for call in self.replies.start_calls
+                    call["msg_seq"] == 1 for call in self.replies.receipt_calls
                 ))
                 image_replies = [
                     context for result, context in self.replies.calls if result.images

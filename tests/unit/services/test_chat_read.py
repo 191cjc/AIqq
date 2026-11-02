@@ -103,7 +103,29 @@ class FakeRepository:
 
     async def query_history(self, group_id, **filters):
         self.calls.append((group_id, filters))
-        return {"messages": list(self.records.values()), "has_more": True, "next_cursor": 1}
+        compact = filters.get("compact", False)
+        messages = list(self.records.values())
+        if compact:
+            messages = [
+                {
+                    "record_id": value["record"]["record_id"],
+                    "role": "user",
+                    "sender_name": "member",
+                    "sent_at": "2026-09-16T00:00:00+00:00",
+                    "content": value["payload"]["content"],
+                    "message_type": 0,
+                    "reply_summary": "",
+                    "has_image": value["derived"]["has_image"],
+                    "image_attachment_indexes": [0],
+                    "recall_state": (
+                        "confirmed" if value["record"]["recalled_at"]
+                        else value["derived"]["recall_state"]
+                    ),
+                    "progress": False,
+                }
+                for value in messages
+            ]
+        return {"messages": messages, "has_more": True, "next_cursor": 1}
 
     async def get_full_record(self, group_id, record_id, version_id=None):
         self.calls.append((group_id, record_id))
@@ -131,24 +153,113 @@ class ChatReadTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.session.close()
 
-    async def test_full_history_group_binding_paging_and_image_ids(self):
+    async def test_compact_history_deduplicates_equivalent_filters_and_budgets_pages(self):
         for _ in range(3):
             result = await self.session.read_history(before_record_id=30, limit=50, keyword="正文")
             self.assertEqual(result["status"], "ok")
-            self.assertEqual(result["messages"][0], self.repository.records[1])
-            self.assertGreater(len(result["messages"][0]["payload"]["content"]), 10000)
+            self.assertEqual(result["messages"][0]["record_id"], 1)
+            self.assertGreater(len(result["messages"][0]["content"]), 10000)
+            self.assertNotIn("payload", result["messages"][0])
+            self.assertEqual(result["records_mode"], "compact")
             self.assertTrue(result["has_more"])
+        self.assertEqual(len(self.repository.calls), 1)
+        self.assertEqual(self.session.history_page_count, 1)
+        await self.session.read_history(before_record_id=20, limit=50, keyword="正文")
+        await self.session.read_history(before_record_id=10, limit=50, keyword="正文")
         self.assertEqual(self.session.image_record_ids, frozenset({1, 2, 3, 4, 6}))
-        blocked = await self.session.read_history()
+        blocked = await self.session.read_history(before_record_id=5)
         self.assertEqual(blocked["error_kind"], "budget_exhausted")
         self.assertEqual(len(blocked["ranges_read"]), 3)
+        self.assertEqual(len(self.repository.calls), 3)
         self.assertTrue(all(call[0] == "group-a" for call in self.repository.calls))
         self.downloader.download_for_read.assert_not_awaited()
+
+    async def test_raw_versions_and_events_keep_complete_records(self):
+        for filters in ({"raw": True}, {"versions": True}, {"events": True}):
+            session = self.service.create_session("group-a")
+            result = await session.read_history(**filters)
+            self.assertEqual(result["records_mode"], "raw")
+            self.assertTrue(result["records_complete"])
+            self.assertIn("payload", result["messages"][0])
+            self.assertFalse(self.repository.calls[-1][1]["compact"])
+            await session.close()
 
     async def test_history_rejects_other_groups_paths_and_invalid_limits(self):
         for filters in ({"group_id": "other"}, {"database": "/secret"}, {"limit": 51}, {"limit": True}, {"record_id": -1}):
             self.assertEqual((await self.session.read_history(**filters))["error_kind"], "invalid_request")
         self.assertEqual(self.repository.calls, [])
+
+    async def test_omitted_and_explicit_default_history_filters_share_one_task(self):
+        first = await self.session.read_history()
+        second = await self.session.read_history(
+            before_record_id=None,
+            record_id=None,
+            message_id="",
+            sender="",
+            keyword="",
+            sent_after="",
+            sent_before="",
+            limit=50,
+            versions=False,
+            before_version_id=None,
+            events=False,
+            before_event_record_id=None,
+            raw=False,
+        )
+
+        self.assertIs(first, second)
+        self.assertEqual(len(self.repository.calls), 1)
+        self.assertEqual(self.session.history_page_count, 1)
+
+    async def test_redundant_raw_flag_on_diagnostics_shares_one_task(self):
+        first = await self.session.read_history(versions=True)
+        second = await self.session.read_history(versions=True, raw=True)
+
+        self.assertIs(first, second)
+        self.assertEqual(first["records_mode"], "raw")
+        self.assertEqual(len(self.repository.calls), 1)
+        self.assertEqual(self.session.history_page_count, 1)
+
+    async def test_cancelled_waiter_does_not_cancel_shared_history_task(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def query_history(_group_id, **_filters):
+            started.set()
+            await release.wait()
+            return {"messages": [], "has_more": False, "next_cursor": None}
+
+        self.repository.query_history = query_history
+        cancelled = asyncio.create_task(self.session.read_history(keyword="same"))
+        await started.wait()
+        survivor = asyncio.create_task(self.session.read_history(keyword="same"))
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+        release.set()
+
+        result = await survivor
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(self.session.history_page_count, 1)
+
+    async def test_failed_equivalent_history_query_is_cached_without_content_leak(self):
+        calls = 0
+
+        async def query_history(_group_id, **_filters):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("private provider detail")
+
+        self.repository.query_history = query_history
+        with self.assertLogs("aiqq.services.chat_read", level="WARNING") as logs:
+            first = await self.session.read_history(keyword="same")
+            second = await self.session.read_history(keyword="same")
+
+        self.assertIs(first, second)
+        self.assertEqual(first["error_kind"], "unavailable")
+        self.assertEqual(calls, 1)
+        self.assertEqual(self.session.history_page_count, 1)
+        self.assertNotIn("private provider detail", logs.output[0])
 
     async def test_distinct_source_budget_and_request_only_reuse(self):
         for record_id in (1, 2, 3, 1):
@@ -211,6 +322,21 @@ class ChatReadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.session.read_image(1))[0]["error_kind"], "closed")
         self.assertEqual(self.session.retrieved_record_ids, frozenset())
 
+    async def test_close_cancels_inflight_history_and_clears_task_index(self):
+        started = asyncio.Event()
+
+        async def query_history(_group_id, **_filters):
+            started.set()
+            await asyncio.Future()
+
+        self.repository.query_history = query_history
+        task = asyncio.create_task(self.session.read_history())
+        await started.wait()
+        await self.session.close()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(self.session.history_page_count, 0)
+
     async def test_version_and_attachment_index_are_forwarded_without_url_override(self):
         result, _ = await self.session.read_image(1, attachment_index=2, version_id=9)
         self.assertEqual(result["version_id"], 9)
@@ -240,12 +366,12 @@ class SkillScriptTests(unittest.TestCase):
         scripts = Path(__file__).resolve().parents[3] / ".agents/skills/aiqq-chat-read/scripts"
         try:
             env = {"AIQQ_CHAT_READ_URL": f"http://127.0.0.1:{server.server_port}", "AIQQ_CHAT_READ_TOKEN": "turn-secret", "PYTHONUTF8": "1"}
-            for script, args in (("read_history.py", ["--before-record-id", "50", "--limit", "50", "--events"]),
+            for script, args in (("read_history.py", ["--before-record-id", "50", "--limit", "50", "--events", "--raw"]),
                                  ("read_image.py", ["--record-id", "21", "--attachment-index", "2", "--version-id", "9"])):
                 result = subprocess.run([sys.executable, str(scripts / script), *args], env=env, capture_output=True, text=True, timeout=5, check=True)
                 self.assertEqual(json.loads(result.stdout), full_result)
                 self.assertNotIn("turn-secret", result.stdout + result.stderr)
-            self.assertEqual(requests[0], ("/history", "Bearer turn-secret", {"before_record_id": 50, "limit": 50, "events": True}))
+            self.assertEqual(requests[0], ("/history", "Bearer turn-secret", {"before_record_id": 50, "limit": 50, "events": True, "raw": True}))
             self.assertEqual(requests[1][2], {"record_id": 21, "attachment_index": 2, "version_id": 9})
         finally:
             server.shutdown()
@@ -269,7 +395,9 @@ class StorageReadIntegrationTests(unittest.IsolatedAsyncioTestCase):
                           "attachments": [{"content_type": "text/plain", "url": "https://example.com/text"},
                                           {"content_type": "image/gif", "url": "https://example.com/a.gif", "future": [None, False, 0]}]},
                 })
-                page = await session.read_history()
+                compact_page = await session.read_history()
+                self.assertNotIn("payload", compact_page["messages"][0])
+                page = await session.read_history(raw=True)
                 wire = page["messages"][0]
                 record_id = wire["record"]["record_id"]
                 self.assertEqual(wire["attachments"][1]["image_attachment_index"], 0)

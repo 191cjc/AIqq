@@ -5,8 +5,8 @@
 Read when modifying NovelAI prompt planning/authoring, quick image composition,
 the `suggest_tags` adapter, related schemas, or bootstrap. Initial options,
 quick images, and revisions require real tag retrieval before the final model
-call. This does not change manual image generation or the separate per-user
-style setting.
+call. QQ `NovelAI生图` requests containing Han characters use the quick-image
+path; direct English image generation and per-user style settings are unchanged.
 
 ## Signatures
 
@@ -90,10 +90,27 @@ to distinguish malformed model output from an unavailable backend.
 
 ## Quick Image Composition
 
-- The public QQ panel includes exactly one managed `NovelAI快速生图` command.
-  The separate in-message feature menu does not include it. Both
-  `NovelAI快速生图 <description>` and the slash-prefixed form preserve the
-  complete trimmed description.
+- For QQ `NovelAI生图`, a nonempty argument containing a Han character
+  (`U+3400`–`U+9FFF`) dispatches to the same quick-image workflow, retaining
+  the original description, sender, quota key and image-start callback. ASCII
+  prompts, empty arguments and non-Han Unicode continue through direct image
+  generation; prompt-option buttons still carry English prompts directly. Direct
+  generation converts fullwidth ASCII and common CJK punctuation to ASCII before
+  auditing and submitting the same composed prompt. Other non-Han Unicode is
+  rejected with an unsupported-character message, not a Chinese-language claim,
+  before image quota or provider calls.
+- Only the Han-triggered `NovelAI生图` branch sends one persistent quoted notice
+  before prompt authoring to explain that the Chinese description is being
+  converted to English. Reserve its QQ sequence before sending. Delivery failure
+  logs a fixed error type and does not stop authoring; cancellation propagates.
+  Authoring failure still returns its existing result, while successful authoring
+  retains the separate admitted-image start notice and final reply in order.
+  Direct English and explicit `NovelAI快速生图` keep their existing notice behavior.
+- Neither the public QQ panel nor the in-message feature menu displays
+  `NovelAI快速生图`. Panel synchronization removes previous copies (including
+  those in shared panels), but both `NovelAI快速生图 <description>` and the
+  slash-prefixed form remain valid text commands and preserve the complete
+  trimmed description.
 - Prompt authoring is shared with `NovelAI提示词`: input audit, planning,
   Danbooru lookup, authoring validation, and all existing failure copy remain
   identical. It still authors exactly three options.
@@ -122,6 +139,7 @@ to distinguish malformed model output from an unavailable backend.
 | Quick command has an empty description | Quick-command usage response; no audit, model, session, style, quota, notice or provider call |
 | Quick prompt authoring fails | Preserve the prompt-flow result and error code; no session or image work |
 | Quick prompt authoring succeeds | Select option zero once, then delegate to the existing image workflow |
+| `NovelAI生图` argument contains Han characters | Reuse quick authoring, then generate directly only if authoring succeeds; no intermediate buttons or image quota on prompt failure |
 
 Tag failures display `Danbooru 标签查询失败，请稍后重试。` in both full text and
 summary, with error code `novelai_tag_search_unavailable`. Never log raw errors,
@@ -168,7 +186,9 @@ without exception messages or tracebacks containing model data.
 - Quick generation covers empty input, every prompt failure boundary, fixed
   first-option selection, no prompt session or intermediate keyboard, current
   style composition, quota/notification ordering, cancellation, and exactly one
-  provider call. Existing create/revise and manual generation remain unchanged.
+  provider call. The QQ router dispatches Chinese and mixed-language manual
+  descriptions to quick generation; English, empty and non-Han input still use
+  the direct image workflow. Existing create/revise flows remain unchanged.
 
 ## Wrong vs Correct
 

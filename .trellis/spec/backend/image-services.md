@@ -1,6 +1,103 @@
 # GPT Image Service Contract
 
+## Web Image Replies
+
+- Chat instructions and strict output use `selected_web_image_urls`, a required
+  ordered array of direct public HTTPS image URLs. Select relevant images according
+  to the user's requested count, capped at `logic.models.MAX_REPLY_IMAGES` (5).
+  Requests above five receive at most five with an explanation. With no requested
+  count, select only useful matching images; no selection is an empty array.
+- The parser validates every URL using the existing public HTTPS restrictions,
+  rejects malformed/oversized arrays, and removes duplicate URLs in order.
+  `ChatAgentOutput` enforces the same selection cap; `ConversationResult` allows
+  at most five images. GPT/NovelAI generation counts remain unchanged.
+- `ConversationWorkflow` downloads selected web images concurrently through the
+  existing validated downloader. Per-image timeouts still apply; returned images
+  retain selection order even if downloads finish in another order. Failed images
+  are omitted, successful images survive, and the full answer explains partial or
+  total failure. Cancellation propagates. Log exception types and request IDs only.
+- Web image provenance includes the successful `source_urls` in image order.
+  QQ presentation keeps its existing loop, compression, storage, individual
+  fallback and sequential `msg_seq` behavior after the final text reply. Web image
+  downloads do not call generation, charge quotas or emit generation notices.
+- Verify empty/one/five selections, six-image rejection, duplicate and unsafe URLs,
+  reverse completion order, partial/total failure, cancellation, and all five
+  selections passing through the actual agent/workflow/QQ presenter.
+
+## Drawing Audit Exemptions
+
+### Scope, identity and configuration
+
+- `AIQQ_IMAGE_AUDIT_WHITELIST` parses comma-separated QQ member IDs using the
+  existing strict `_member_ids` validator. Default is empty. This is independent
+  of `AIQQ_NAI_V5_WHITELIST`, which affects quotas only; neither implies the other.
+- Bootstrap constructs one immutable `logic/image_audit.py::ImageAuditPolicy`
+  and injects it into explicit GPT, original NovelAI, Nai v5 and drawing-related
+  prompt authoring workflows. Exact nonempty incoming `member_openid` membership
+  determines exemption across groups, not a display name, prompt text, account
+  type or parsed quota/conversation key. Bot senders can be legitimate members.
+- The router passes actual sender identity to `GPTImageWorkflow.run`, whose
+  added optional `member_openid=""` keeps old callers audited. Original NovelAI
+  and Nai v5 already receive actual identity separately from their quota key.
+- `Nai v5 <scene>` and `/Nai v5 <scene>` are short aliases for `nai_v5_image`,
+  sharing the canonical `Nai v5 作图` workflow, including audit exemptions,
+  styles, quotas, recall/receipt and scene-prompt access. Parse the explicit
+  `作图` and `画风` subcommands first; preserve rejection of malformed subcommand
+  prefixes lacking their required whitespace boundary. The alias itself also
+  requires whitespace before its scene. A bare alias follows the existing
+  empty-image input response.
+
+### Workflow and layout contract
+
+- An exempt explicit drawing request skips the entire local image-prompt audit
+  call, including safety and scene effectiveness. Ordinary senders retain the
+  exact existing rejection/unavailable/cancellation behavior.
+- Legacy Chinese/quick drawing carries the real sender into
+  `NovelAIPromptWorkflow.author(description, *, member_openid="")`; both its
+  pre-translation audit and the final combined scene/style audit are skipped
+  for the same policy. Translation/tag authoring still runs. Standalone prompt
+  options call author without an exemption identity and remain audited.
+- Without a model audit, NovelAI/Nai v5 select orientation locally from the
+  scene only via `infer_image_orientation`. Recognize standalone English
+  `lying`/`reclining` or explicit Chinese lying hints as landscape; `full body`
+  (including underscores or whitespace) or 全身 as portrait; otherwise square.
+  Lying takes priority. Do not mistake `flying` for `lying` or 卧室 for a pose,
+  and do not infer layout from saved artist/style text. This recognizes explicit
+  hints, not the audit model's full natural-language interpretation. Explicit
+  GPT requests use automatic sizing through the direct Images API adapter below.
+- Keep nonempty-input checks, original NovelAI character/language requirements,
+  personal style composition, service parameters/instructions, reference/image
+  validation, quota admission/accounting, notices, delivery and cleanup. This
+  whitelist does not alter provider or QQ moderation and adds no retry/replay.
+- General conversation auditing is not bypassed by this drawing-command policy.
+  Configuration takes effect after the normal service restart; never hard-code
+  user identities in production source or log prompts/secrets.
+
+### Required regression coverage
+
+- Default/strict configuration, independence from the quota whitelist, exact ID
+  matching including absent/spoofed identity, and local orientation precedence.
+- Real router/bootstrap/config/workflows for both configured accounts, across
+  groups and both bot/human-style identities. Mock rejecting/unavailable audits
+  and paid generation: exempt paths must make zero audit calls, while ordinary
+  and quota-only senders still fail before generation.
+- Exercise legacy direct, Chinese/quick (both stages), direct Chinese Nai v5
+  and explicit GPT commands. Preserve style composition, scene-only prompt
+  access, callbacks, empty/language checks, quotas and failure/cancellation
+  cleanup. Check standalone prompt options retain auditing and policy survives
+  application rebuild. No live QQ messages or paid generations are required.
+- Test actual command text through QQ ingress/handler/parser, not only manually
+  constructed `ParsedCommand` values. An unrecognized `/Nai v5 <tags>` previously
+  fell into ordinary conversation audit despite a correct drawing whitelist.
+  Cover native/text bot mentions, raw/SDK callbacks, bot-member identity, short
+  aliases, canonical style precedence and ordinary senders retaining auditing.
+
 ## Image Generation Start Notice
+
+The admission-time notice contract below applies to GPT. Explicit NovelAI/Nai v5
+commands now use the immediate combined receipt described in
+"Immediate NovelAI Receipt, Request Recall and Prompt Access" below, suppressing
+their later start callback's message to avoid a duplicate receipt.
 
 ### Scope and signatures
 
@@ -109,7 +206,99 @@ Wrong: infer visible quoting from a successful passive reply or from a stored
 `source_message_id` alone. Correct: opt in to the explicit `message_reference`
 field and verify it survives installed SDK serialization.
 
-## Scope / Trigger
+## Immediate NovelAI Receipt, Request Recall and Prompt Access
+
+- Nonempty `novelai_image`, `novelai_quick_image` and `nai_v5_image` commands
+  reserve one sequence and call `ConversationReplySender.acknowledge_image_request`
+  before style loading, auditing, translation or quota admission. It attempts
+  `QQMessageSender.recall_member_message` once for the incoming group/message ID,
+  then sends ONE receipt containing both received and recall status. Legacy
+  Chinese translation wording belongs to that same receipt. Suppress the later
+  start callback's message, even after an ambiguous failed receipt send.
+- Do not quote the recalled source or include its prompt in the receipt. Empty
+  commands, prompt authoring, style settings, GPT and ordinary chat do not recall
+  user messages. Gateway deduplication also prevents duplicate recall/receipt.
+- Only API success reports `原消息已撤回`; permission/expiry/other failures use
+  fixed explanatory wording and continue generation. Receipt failure consumes
+  its sequence and does not trigger a second receipt. Cancellation propagates
+  before generation/admission. The existing bot-progress recall retains its
+  local ownership check and two-minute window.
+- QQ official group recall requires the bot to be a group administrator and the
+  sender to be an ordinary member, within two minutes of sending. Use `d.id` from
+  the incoming event and `DELETE /v2/groups/{group_openid}/messages/{message_id}`.
+  Errors 40062003/40064004 mean permission/expiry. botpy 1.2.1 discards response
+  codes, so also recognize its exact retained messages `无操作权限` and
+  `已超出消息撤回时限`; HTTP 403 is permission denial. Never expose raw errors.
+  Reference: https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages_message_id.delete.html
+- Successful recall records a trusted member confirmation in history. A local
+  persistence failure cannot change an already successful remote recall to a
+  failed claim. See the member recall contract in `chat-read.md`.
+- Successful images from all three commands enable the existing prompt link.
+  `ConversationResult.generation_prompt` contains the scene captured BEFORE
+  saved style composition; auditing/generation still use the composed prompt.
+  Legacy Chinese input exposes the authored English scene; V5 preserves its
+  direct input. Do not subtract style tags from the completed string, because
+  users may intentionally include the same words. Save the raw scene to the
+  existing reply store; append `?view=prompt` to request literal copy rendering.
+  Provider-added safety/negative prefixes never enter this scene field.
+- Verify immediate recall/receipt order, success and permission/expiry failures,
+  one notice including translation, sequence consumption, cancellation, dedup,
+  every command's final link, independent saved styles and exact copied text.
+
+## Direct GPT Image API (Production)
+
+- Bootstrap shares one `GPTImageService` between explicit `/GPT生图` and
+  ordinary-chat generation/edit. It directly calls `/images/generations` for
+  generation and multipart `/images/edits` for reference edits. It does not use
+  a Codex image thread, a Responses driver, or the `image_generation` tool.
+- `OPENAI_IMAGE_MODEL` defaults to `gpt-image-2.5-flare`; image key and base URL
+  retain their independent fallbacks to chat configuration. The old
+  `OPENAI_IMAGE_DRIVER_MODEL` remains parsed for compatibility and is unused by
+  production image generation.
+- Both operations explicitly request `response_format="b64_json"`. The configured
+  provider returned HTTP 200 without a usable Base64 result when this field was
+  absent. A successful status alone never establishes that an image was received.
+  Use `n=1`, quality high, `size="auto"` and the existing safe instruction; edits
+  retain high input fidelity and validated, unchanged reference bytes. Do not
+  request an output format or compression level.
+- Decode Base64 and validate the actual image, retaining the exact original bytes,
+  MIME type, canvas, transparency and metadata. Do not reencode, transpose EXIF,
+  flatten alpha, crop, resize or pad. Keep image admission, quotas, audit, notices,
+  safe error classification and selective 502 retries.
+- Both generation and editing use automatic sizing, including older actions with
+  valid explicit width/height fields. These fields remain schema-compatible but
+  never override `size="auto"`. Native-size selection and JPEG normalization are
+  retained exclusively for the unwired legacy Responses adapter.
+- Chat instructions and the GPT image action skill set both dimensions to null.
+  Include user dimension/aspect/composition requests in the prompt without
+  promising a matching canvas. Do not infer a request to crop or pad a reference.
+- Accept valid returned images even when their dimensions or aspect ratio differ
+  from the reference or user preference. There is no `size_mismatch` rejection or
+  special `unsupported_size` classification. Log reference/request/output
+  dimensions without prompts, credentials or image data.
+- The QQ presenter bypasses `prepare_qq_image` for results with GPT provenance.
+  Store and upload original bytes even above QQ's usual 2 MiB preparation limit;
+  if QQ rejects delivery, the existing viewing link serves that same original.
+  Preserve upload compression for other image providers.
+- Live long-image probe on 2026-10-23 used a synthetic 1080x5037 reference.
+  The configured provider rejected exact `size=1080x5037` with HTTP 400 and
+  `The requested image size is invalid.`. A separate `size=auto` probe returned
+  895x1757 and changed the aspect ratio. The user's selected policy is automatic
+  sizing and displaying the valid returned result unchanged, with no dimension
+  matching rejection or local transformation.
+- Verify outgoing generation JSON and edit multipart fields through a real SDK
+  with MockTransport, and verify bootstrap injects the direct adapter into both
+  image workflows. Never add a second provider call for a successful generation.
+- Live validation on 2026-10-21: the configured image key generated a validated
+  1024x1024 PNG through `/images/generations` with `gpt-image-2.5-flare` and
+  explicit Base64 output. The production adapter also completed a reference edit
+  through `/images/edits`, returning a validated 1024x1024 RGB JPEG with the
+  requested added leaf. The same model on the previous `/responses` route
+  returned HTTP 404. Do not log credentials, signed image URLs or raw responses.
+
+## Legacy Responses Adapter (Reference)
+
+### Scope / Trigger
 
 Read this when changing `src/aiqq/services/images/codex_responses.py`, shared helpers in `gpt.py`, the image-only SDK mode, image configuration/bootstrap, GPT image workflow errors, or image request tests. The packaged implementation is authoritative; root-level legacy modules are reference material only.
 
@@ -132,18 +321,18 @@ The common exception lives in `aiqq.exceptions`. `GPTImageError` specializes it 
 
 ## Request, Response, and Configuration
 
-- Production uses `CodexResponsesImageService`: genuine Codex SDK/CLI → authenticated temporary loopback bridge → configured HTTPS `/responses`. Both generate and edit declare only `image_generation` and force that tool. Edit forwards the SDK-encoded reference image in Responses input.
+- The retained `CodexResponsesImageService` uses genuine Codex SDK/CLI → authenticated temporary loopback bridge → configured HTTPS `/responses`. It is no longer wired by production bootstrap. Both generate and edit declare only `image_generation` and force that tool. Edit forwards the SDK-encoded reference image in Responses input.
 - The current provider restricts the image key to official Codex clients. Preserve genuine SDK headers; do not forge an official client identity on an ordinary HTTP call. Bridge requests accept only the per-attempt token, fixed path and configured driver model; the actual image key stays in the bridge.
-- `OPENAI_IMAGE_DRIVER_MODEL` defaults to `gpt-6-astra`, independently of the chat model. `OPENAI_IMAGE_MODEL` defaults to `gpt-image-2` and selects the hosted tool model. Current provider tests show `gpt-5.6-sol` routes through Responses Lite, which rejects `image_generation`; this is a provider-specific observation, not a universal model claim.
-- Ordinary-chat `image_action` owns optional custom `width` and `height`. Both fields are required-nullable in structured output: `null/null` means the deterministic 1024x1024 target; integers must be paired, each be within 256..2048, and total at most 4,194,304 pixels. Missing, partial, non-integer or out-of-range values are invalid agent output. Historical `ImageAction` construction without dimensions remains compatible with the square default.
-- The provider still accepts only `1024x1024`, `1024x1536`, or `1536x1024`. Select the native request size with the nearest symmetric aspect-ratio distance, then normalize locally to the exact custom target. Do not send arbitrary dimensions or provider `auto`. The explicit `/GPT生图` workflow has no skill dimension fields and remains 1024x1024. Image audit orientation remains for NovelAI and does not overwrite GPT action dimensions.
+- This legacy adapter's constructor retains `gpt-6-astra` as the driver and `gpt-image-2` as its tool model. Production configuration now defaults to the direct model documented above. Historical provider tests showed `gpt-5.6-sol` routing through Responses Lite, which rejected `image_generation`; this was a provider-specific observation, not a universal model claim.
+- Ordinary-chat `image_action` owns optional custom `width` and `height`. Both fields are required-nullable in structured output: `null/null` means the deterministic 1024x1024 request; integers must be paired, each be within 256..2048, and total at most 4,194,304 pixels. Missing, partial, non-integer or out-of-range values are invalid agent output. Historical `ImageAction` construction without dimensions remains compatible with the square default.
+- The provider still accepts only `1024x1024`, `1024x1536`, or `1536x1024`. Custom dimensions select the native request size with the nearest symmetric aspect-ratio distance; they do not prescribe a local output canvas. Do not send arbitrary dimensions or provider `auto`. The explicit `/GPT生图` workflow has no skill dimension fields and requests 1024x1024. Image audit orientation remains for NovelAI and does not overwrite GPT action dimensions.
 - Tool defaults remain `quality="high"`, `output_format="jpeg"`, compression 85. Editing retains `input_fidelity="high"`. Do not pass Images API fields such as `n` or `response_format` to the tool.
-- Require `response.completed` and a completed `image_generation_call.result`; validate its Base64 and actual image, then normalize to an RGB JPEG whose dimensions match the resolved target canvas, which can differ from the native request size. HTTP 200, an image-start event or text alone is not success. Parse SSE with bounded storage and correct fragmented UTF-8/event handling.
+- Require `response.completed` and a completed `image_generation_call.result`; validate its Base64 and actual image, then convert to an RGB JPEG while preserving the returned dimensions and composition after EXIF orientation. Do not resize, crop, or add canvas padding to match requested dimensions. Transparent pixels retain the existing white alpha background for JPEG conversion. `ImageAsset` metadata must match the actual encoded image. QQ's separate upload size limit may still require proportional compression. HTTP 200, an image-start event or text alone is not success. Parse SSE with bounded storage and correct fragmented UTF-8/event handling.
 - `OPENAI_IMAGE_API_KEY` and `OPENAI_IMAGE_BASE_URL` fall back independently to chat configuration. Verify the effective pair and model when diagnosing the provider; do not log the configuration object or credentials.
 - The adapter retries only HTTP 502, at most twice after delays of 0.5 and 1 second, for at most three generation/edit POSTs per business attempt. Each retry reuses the same model, prompt and reference bytes. All other HTTP statuses, timeouts, connection errors and invalid image responses stop without retry.
 - Image-only SDK mode disables request and stream retries and web tools. Image success comes from the captured Responses stream, independently of the SDK's final structured acknowledgement. Default chat/audit mode is unchanged and cannot invoke native image generation. Selective retries belong to the bridge and apply only to HTTP 502 before streaming. Accept one logical SDK request per attempt; reject additional SDK requests locally to avoid duplicate generation.
 - A stream error, interrupted SSE, failed/incomplete terminal, absent/invalid image or timeout is never retried. `OPENAI_IMAGE_TIMEOUT_SECONDS` bounds the whole image attempt. Timeout, cancellation and service close must stop the SDK, upstream HTTP operation and loopback listener.
-- The old Images API adapter remains available for existing helpers/tests, but production does not fall back to it automatically.
+- Production uses the direct Images API adapter above. Neither adapter automatically falls back to the other.
 - A business attempt has one started and one finished event. Each scheduled retry has a gpt_image_retry event with the same attempt_id, retry_number, delay_seconds, HTTP status, safe provider request ID and bounded error diagnostics. A later timeout must not inherit the prior 502's response metadata. Cancellation during backoff or a request stops subsequent requests and propagates normally.
 - Only validated, normalized images count as local generation successes. All failed/cancelled attempts release image admission. Local failure does not establish the provider's billing outcome.
 
@@ -165,14 +354,14 @@ Both GPT workflows use `image_failure_result`; known errors produce `image_servi
 
 ## Good / Base / Bad Cases
 
-- Good: a 1920x1080 chat action becomes a `1536x1024` request and a normalized 1920x1080 JPEG; `null/null` and direct-command generation remain deterministic 1024x1024 requests and results.
+- Good: a 1920x1080 chat action becomes a `1536x1024` request; a returned 1536x1024 image keeps that size and its full composition. `null/null` and direct-command generation remain deterministic 1024x1024 requests, with output dimensions taken from the actual returned image.
 - Base: a provider 404 records operation, attempt ID, status, provider request ID and a safe diagnostic, while QQ receives fixed text.
 - Bad: a provider echoes credentials, prompts, image data or HTML; raw content must not reach logs or QQ. Diagnostic metadata is bounded and cleaned.
 
 ## Required Tests
 
 - Use a fake SDK sender plus MockTransport to assert actual outgoing Responses tool schema, driver model, image credentials and reference input forwarding. Retain old AsyncOpenAI JSON/multipart tests for the legacy adapter.
-- Cover required-nullable custom dimensions, boundary and invalid combinations in the skill, chat Schema and domain object. Across ordinary-chat generation/edit and both adapters, assert that native request selection is nearest by aspect ratio while actual JPEG dimensions and `ImageAsset` metadata match the exact target. Keep explicit generation, historical actions and NovelAI regression coverage.
+- Cover required-nullable custom dimensions, boundary and invalid combinations in the skill, chat Schema and domain object. Across ordinary-chat generation/edit and both adapters, assert that native request selection is nearest by aspect ratio while actual JPEG dimensions and `ImageAsset` metadata match the returned image. Verify default and custom requests preserve edge content without cropping or canvas padding. Keep explicit generation, historical actions and NovelAI regression coverage.
 - Cover authenticated path/model guards, duplicate SDK POST rejection, image-only SDK configuration and unchanged ordinary chat defaults.
 - Cover fragmented UTF-8 and SSE, response size limits, terminal failures/incompletion, valid completed image results and cleanup on cancellation/close/timeout.
 - Count actual transport requests for non-502 failures and timeouts to verify no retry.
@@ -186,6 +375,59 @@ Both GPT workflows use `image_failure_result`; known errors produce `image_servi
 Wrong: treat `/models` missing an image model as proof that the provider cannot generate images, or log only `HTTP 404` and guess the cause.
 
 Correct: inspect the actual endpoint and error. The old Images API `model_not_found` account-group failure does not establish whether a Responses driver account can execute a hosted image tool. The current image key successfully generated and edited images through genuine Codex + `gpt-6-astra` + `image_generation` on 2026-09-15. Ordinary direct HTTP returned 403; the `gpt-5.6-sol` Codex route returned a Responses Lite tool rejection. Verify the exact chosen route with a decodable image before declaring recovery.
+
+## Audit Rejection Feedback
+
+### Scope / Trigger
+
+Apply when presenting rejected ordinary-chat input, explicit GPT/NovelAI image
+prompts, NovelAI prompt authoring, or an image action requested by ordinary chat.
+
+### Signatures
+
+`PromptAuditResult.reason` and `ImagePromptAuditResult.reason` are validated,
+nonempty audit outputs. `audit_rejection_summary(reason)` fits the reason into
+the 50-character `ConversationResult.summary`. `image_audit_rejection_result`
+reuses the same copy for explicit and ordinary-chat image rejection.
+
+### Contracts
+
+- For rejected input, keep the category-specific refusal and append `原因：<reason>`
+  to `full_text`; `summary` carries the brief reason instead of fixed refusal copy.
+- For rejected image prompts, retain the safe `可改为：` suggestion in `full_text`,
+  and show the audit reason in `summary`. An English-only rejection retains its
+  fixed English requirement as the reason. Trim long summaries with an ellipsis.
+- Ordinary-chat image-action audit rejection is `rejected`, not an unavailable
+  provider failure. Do not reserve quota or invoke generation after rejection.
+- Ask auditors for concise, specific, non-graphic reasons without quoting
+  user-supplied content or proposing policy bypasses. Do not log audit reasons,
+  prompts, or raw exceptions. Audit outages retain fixed unavailable messages.
+
+### Validation and Error Matrix
+
+| Case | User-visible result |
+| --- | --- |
+| Input or image audit rejects | Main reason in QQ summary; full reason and applicable suggestion in full output |
+| Audit reason exceeds summary limit | At most 50 characters with ellipsis; full reason preserved |
+| Audit provider unavailable | Existing fixed unavailable copy; no fabricated rejection |
+
+### Good / Base / Bad Cases
+
+Good: `effective=false` with reason "缺少可绘制的画面内容" exposes that reason
+without generating. Base: accepted audit leaves the normal reply path unchanged.
+Bad: only show "图片提示词未通过审核" while storing the actual reason behind a link.
+
+### Required Tests
+
+Cover rejected input, GPT/NovelAI and quick-image audits, embedded chat image
+actions, long reason clipping, preserved safe suggestions, and no quota or image
+call on rejection. Existing successful generation and unavailable paths still pass.
+
+### Wrong vs Correct
+
+Wrong: use a fixed `summary` after attaching the reason only to `full_text`,
+or treat an image audit rejection as a provider outage. Correct: put the bounded
+reason in the QQ-visible summary and preserve the full detail separately.
 
 ## QQ Upload Size Contract
 
@@ -212,7 +454,8 @@ def prepare_qq_image(image: ImageAsset) -> ImageAsset: ...
 | --- | --- |
 | Size <= 2 MiB | Original asset unchanged |
 | Size > 2 MiB and valid | JPEG <= 2 MiB, preserving aspect ratio |
-| Invalid oversized image / encode failure / cannot fit | Existing fixed QQ image-delivery failure text; do not save/upload oversized original |
+| Valid original but encode/resize/cannot-fit failure | Save the validated original for a temporary public viewing button only; never upload unprepared oversized bytes |
+| Invalid oversized image / temporary storage failure | Fixed QQ image-delivery failure text without a broken viewing button; no upload |
 | Cancellation during preparation | Propagate cancellation; no subsequent upload |
 
 ### Cases and required tests
@@ -227,6 +470,46 @@ def prepare_qq_image(image: ImageAsset) -> ImageAsset: ...
 Wrong: treat QQ `850027` (remote media upload timeout) as a GPT generation error, or compress only images produced by one provider.
 
 Correct: enforce the size limit at the shared QQ delivery boundary. The observed web image was downloaded successfully; QQ fetched only 4,734,601 of 4,999,518 bytes before reporting timeout. Local compression reduces transfer size without repeating generation.
+
+## Temporary Image Viewing After Delivery Failure
+
+### Ownership and contract
+
+- The shared final presenter in `interfaces/qq/reply.py` retains the media URL
+  independently of readiness to upload. Preparation success stores the prepared
+  image once and reuses its URL when QQ upload/send fails. Preparation failure
+  revalidates the source bytes off the event loop and stores the valid original
+  for viewing only, deriving MIME and dimensions from those bytes.
+- A stored image's failure notice is Markdown with a `查看图片` URL button,
+  using the existing `_link_row` action type 0 and public `/media/{token.ext}`
+  route, just like `查看完整输出`. Keep the fixed generic or QQ content-rejection
+  explanation, mention the original member, explain temporary expiry, and
+  retain available full-output and generation-prompt links in the same keyboard.
+- The failure notice uses the image outcome's existing sequence and original
+  request context; preserve expired-passive recovery and successful-history
+  recording. No additional image upload, generation, quota charge or replay.
+- Invalid source bytes, generation without a usable image, or failed media
+  storage cannot produce a valid image link: keep the plain failure notice
+  without a fabricated URL. Do not use input/reference images as substitutes
+  for an unavailable generated result.
+- Reuse the configured media TTL (default 900 seconds), file permissions and
+  HTTP headers. Expired links return 404. Do not introduce permanent storage,
+  a new page or third-party host. Log fixed event/type metadata only.
+- Cancellation during preparation, fallback validation/storage, upload or
+  notice delivery propagates and stops subsequent operations. A failed button
+  notice is not retried. Preserve image storage before the first text send.
+
+### Required regression coverage
+
+- Feed real SDK upload/send rejection and expired-passive fallback payloads
+  through foreground/deferred completion, checking the URL button, fixed copy,
+  original context, sequence, recorded successful text and single upload.
+- Exercise actual encoding/resize exceptions with valid oversized source
+  bytes; confirm that only the original is stored and QQ is not called. Verify
+  the original's MIME/extension and byte-for-byte HTTP response.
+- Check the QQ upload failure button opens the actual prepared JPEG within
+  the upload limit. Cover expiry 404, invalid images, storage failure, existing
+  prompt/full-output buttons, no broken links and cancellation/no retry.
 
 ## Expired QQ Reply Delivery
 
@@ -291,6 +574,8 @@ message, not provider response text. Public sender signatures remain unchanged.
   Attribute the classification to QQ; do not assert which depicted element was
   responsible, that generation failed, or that every image was AI-generated.
 - Unknown send failures and local preparation failures keep the generic text.
+  A successfully stored image adds the temporary viewing notice/button defined
+  above; the QQ-specific explanation remains intact.
   No additional send/upload/generation retry, billing or quota change. Existing
   expiry recovery, image-only payloads, original source/member association and
   cancellation propagation remain in force. Do not expose raw exception text.
@@ -299,10 +584,10 @@ message, not provider response text. Public sender signatures remain unchanged.
 
 | Condition | Behavior |
 | --- | --- |
-| Exact SDK content rejection on image upload/send | Shared rejection exception; fixed QQ-specific notice |
+| Exact SDK content rejection on image upload/send | Shared rejection exception; fixed QQ-specific notice plus temporary image viewing button when stored |
 | Content rejection on the existing proactive image fallback | Same notice; no further fallback/upload |
 | Text/Markdown rejection, other exception class or changed error message | Preserve existing exception behavior |
-| Unknown image error or preparation failure | Existing generic image failure notice |
+| Unknown image error or preparation failure | Existing generic image failure notice plus viewing button when a valid image is stored |
 | Cancellation | Propagate; no notice or additional call |
 
 ### Cases
@@ -367,3 +652,49 @@ The 17:44:50 request on 2026-09-15 selected record 609, whose temporary media re
 - Failed generation and cancellation release image admission without success accounting. No new automatic generation retry is introduced. Keep model, prompt safeguards, steps, quota and QQ compression/delivery contracts unchanged.
 - Regression coverage includes real bootstrap wiring from an explicit URL and temporary 0600 credential file with mocked MCP discovery, missing configuration, failed/missing-tool discovery, fixed safe failure messages, and current health snapshot. A fake injected service alone cannot catch deployment configuration omissions.
 - In the observed 2026-09-15 failure, configuration was empty, the client was None, and generation failed locally before reaching MCP. Old credentials still worked for initialize/tools/list. Record actual generation verification separately from connection/discovery checks.
+
+## Provider-specific NovelAI Negative Prompts
+
+- The packaged adapter `services/images/novelai.py` owns two independent fixed
+  strings: `NovelAIService.generate()` sends `SAFE_NEGATIVE_PROMPT`, while
+  `NaiV5Service.generate()` sends `NAI_V5_NEGATIVE_PROMPT` in the MCP
+  `generate_image` argument `negative_prompt`.
+- The legacy preset contains only the existing adult-content exclusions. V5
+  retains these exclusions except `loli`, `cleavage` and `shota`, and adds the
+  user-requested quality, anatomy, artifact, text/watermark and style exclusions.
+  `child sexualization` remains present in both presets.
+- Deduplicate the fixed v5 preset by tag when editing it. If plain and weighted
+  versions coexist in the requested list, retain the weighted version only.
+  Forward brackets and numeric weights verbatim, including `[abstract]`,
+  `{{{{unskillful}}}}` and `3::anatomical nonsense::`. No runtime tag rewriting
+  or negative-prompt command is introduced.
+- These are exclusions, so tags such as `lineart`, `retro artstyle`,
+  `depth of field` and `old` also suppress those requested styles or features.
+- Verify actual outgoing arguments for both adapters using fake MCP clients:
+  v5 omits the three removed tags and retains the requested weights; legacy
+  retains its preset and receives no new quality or anatomy exclusions. Mocked
+  argument verification does not establish rendered quality or remote weighting
+  behavior. Preserve the existing input audit and positive safety prefix.
+
+## Nai v5 Explicit Random Seeds
+
+- `NaiV5Service.generate()` samples a fresh nonzero unsigned 32-bit seed per
+  admitted invocation using `secrets.randbelow(2**32 - 1) + 1`, and sends that
+  integer in the MCP `generate_image` argument `seed`. Do not cache the sampled
+  seed on the client or service, or use prompt-derived seeds. Separate random
+  samples may theoretically collide; no uniqueness guarantee is introduced.
+- Validate configuration, readiness and orientation before sampling. Each
+  actual provider invocation records `event=nai_v5_generation_requested seed=N`
+  inside the existing semaphore boundary. Log only the numeric seed, never
+  prompts, image data, sender identifiers, authorization or response bodies.
+- In the 2026-10-09 investigation, all five retained V5 PNGs reported seed 0.
+  AiQQ's requests hard-coded 0, and the public upstream tool/request/payload
+  code forwarded that value unchanged even though its docs said `0 = random`.
+  The live tool schema advertised integer/default 0 without promising a
+  conversion. Prefer observed metadata and executable behavior over a default
+  value or prose description when validating provider randomness.
+- Regression coverage must submit the same prompt repeatedly through the real
+  adapter with a fake MCP client and deterministic random samples, assert that
+  each outgoing request receives its sampled seed, and cover the lower and
+  upper bounds `1` and `4294967295`. No paid generation is required. Keep the
+  legacy adapter's `seed=None` behavior and V5's other generation parameters.

@@ -118,9 +118,11 @@ class GroupMessageRepositoryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([item.content for item in history], ["hello", "searching", "temporary final"])
-        self.assertTrue(history[1].record["derived"]["progress"])
-        self.assertEqual(history[2].record["derived"]["recall_state"], "confirmed")
+        self.assertTrue(history[1].progress)
+        self.assertEqual(history[2].recall_state, "confirmed")
         self.assertTrue(history[0].has_image)
+        self.assertEqual(history[0].image_attachment_indexes, (0,))
+        self.assertTrue(all(not item.record for item in history))
 
     async def test_reference_image_urls_are_group_scoped_and_include_quotes(self):
         event_type, payload = group_event(
@@ -200,8 +202,9 @@ class GroupMessageRepositoryTests(unittest.IsolatedAsyncioTestCase):
             "group-1", before_message_id="", limit=50
         )
         self.assertEqual(len(history), 50)
-        self.assertEqual(history[0].record["record"]["message_id"], "progress-10")
-        self.assertTrue(all(item.record["derived"]["progress"] for item in history))
+        self.assertEqual(history[0].record_id, 12)
+        self.assertTrue(all(item.progress for item in history))
+        self.assertTrue(all(not item.record for item in history))
         self.assertTrue(await self.repository.has_before("group-1", history[0].record_id))
 
     async def test_console_context_only_uses_recent_mentions_and_free_sequence(self):

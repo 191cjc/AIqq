@@ -40,6 +40,47 @@ class NovelAIStyleRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.repository.load("first"))
         self.assertEqual(await self.repository.load("second'"), "pixel art")
 
+    async def test_v5_initialization_does_not_copy_or_change_legacy_styles(self):
+        await self.repository.save("member", "watercolor")
+        v5 = NovelAIStyleRepository(self.connection, provider="nai_v5")
+        await v5.initialize()
+        await v5.initialize()
+        self.assertIsNone(await v5.load("member"))
+        self.assertEqual(await self.repository.load("member"), "watercolor")
+
+    async def test_provider_styles_replace_clear_and_persist_independently(self):
+        v5 = NovelAIStyleRepository(self.connection, provider="nai_v5")
+        await v5.initialize()
+        await self.repository.save("member", "watercolor")
+        await v5.save("member", "pixel art")
+        await self.repository.save("member", "oil painting")
+        self.assertEqual(await v5.load("member"), "pixel art")
+        await v5.save("member", " \n ")
+        self.assertEqual(await self.repository.load("member"), "oil painting")
+        self.assertIsNone(await v5.load("member"))
+
+        prompt = "{{pixel art}},\n1.2::soft  lighting::"
+        await v5.save("member", f"  {prompt} \n")
+        await self.repository.save("member", "")
+        self.assertEqual(await v5.load("member"), prompt)
+        await self.repository.save("member", "watercolor")
+        await v5.save("other'", "ink drawing")
+        await self.connection.close()
+        self.connection = SQLiteConnection(self.path)
+        self.repository = NovelAIStyleRepository(self.connection)
+        v5 = NovelAIStyleRepository(self.connection, provider="nai_v5")
+        await self.repository.initialize()
+        await v5.initialize()
+        self.assertEqual(await self.repository.load("member"), "watercolor")
+        self.assertEqual(await v5.load("member"), prompt)
+        self.assertEqual(await v5.load("other'"), "ink drawing")
+        self.assertIsNone(await self.repository.load("other'"))
+
+    async def test_unknown_provider_cannot_select_arbitrary_storage(self):
+        for provider in ("shared", "novelai_user_styles", "nai_v5; DROP TABLE novelai_user_styles"):
+            with self.subTest(provider=provider), self.assertRaises(ValueError):
+                NovelAIStyleRepository(self.connection, provider=provider)
+
     async def test_empty_identity_cannot_read_or_modify_shared_settings(self):
         for member_openid in ("", " \t "):
             with self.subTest(member_openid=member_openid):

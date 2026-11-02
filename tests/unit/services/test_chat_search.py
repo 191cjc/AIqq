@@ -88,7 +88,9 @@ class ChatSearchTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_bytes_headers_and_credentials_are_forwarded_without_history_mutation(self):
         body = '{ "model": "native-model", "commands": {"search_query": [{"q": "测试"}]}, "input": [], "unknown": null }'.encode()
         async with self.bridge(enable_web_search=True) as bridge:
-            bridge._history_context.append({"private": "history must not enter search"})
+            bridge._pending_history_context.append(
+                {"private": "history must not enter search"}
+            )
             headers = {"Authorization": "Bearer " + bridge.model_token,
                 "Content-Type": "application/json", "User-Agent": "codex_cli_rs/0.152.1",
                 "Originator": "codex_cli_rs", "X-Native-Feature": "unchanged"}
@@ -233,7 +235,7 @@ class ChatSearchTests(unittest.IsolatedAsyncioTestCase):
                     model="gpt-6-astra", cli_path=cli, runtime_dir=root / "runtime", work_dir=root / "work")
                 try:
                     async with asyncio.timeout(30):
-                        result = await backend.run(instructions="Search and return JSON.", model_input=model_input,
+                        result = await backend.run(purpose="chat", instructions="Search and return JSON.", model_input=model_input,
                             output_schema=SCHEMA, enable_web_search=True, chat_read_session=ReadSession())
                 finally:
                     await backend.close()

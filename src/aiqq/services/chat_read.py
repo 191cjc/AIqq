@@ -32,7 +32,22 @@ IMAGE_READ_MESSAGES = {
 _HISTORY_KEYS = {
     "before_record_id", "record_id", "message_id", "sender", "keyword",
     "sent_after", "sent_before", "limit", "versions", "before_version_id",
-    "events", "before_event_record_id",
+    "events", "before_event_record_id", "raw",
+}
+_HISTORY_DEFAULTS: dict[str, Any] = {
+    "before_record_id": None,
+    "record_id": None,
+    "message_id": "",
+    "sender": "",
+    "keyword": "",
+    "sent_after": "",
+    "sent_before": "",
+    "limit": MAX_HISTORY_PAGE_SIZE,
+    "versions": False,
+    "before_version_id": None,
+    "events": False,
+    "before_event_record_id": None,
+    "raw": False,
 }
 
 
@@ -76,6 +91,9 @@ class GroupChatReadSession:
         self._lock = asyncio.Lock()
         self._history_pages = 0
         self._history_ranges: list[dict[str, Any]] = []
+        self._history_tasks: dict[
+            tuple[tuple[str, Any], ...], asyncio.Task[dict[str, Any]]
+        ] = {}
         self._retrieved_record_ids: set[int] = set()
         self._image_record_ids: set[int] = set()
         self._image_tasks: dict[
@@ -87,6 +105,14 @@ class GroupChatReadSession:
     @property
     def retrieved_record_ids(self) -> frozenset[int]:
         return frozenset(self._retrieved_record_ids)
+
+    @property
+    def history_page_count(self) -> int:
+        return len(self._history_tasks)
+
+    @property
+    def image_read_count(self) -> int:
+        return len(self._image_tasks)
 
     @property
     def image_record_ids(self) -> frozenset[int]:
@@ -108,36 +134,57 @@ class GroupChatReadSession:
         if not _valid_history_filters(filters):
             return {"status": "error", "error_kind": "invalid_request",
                     "message": "历史查询参数无效，请使用同群消息编号、时间、发送者或关键词。"}
+        normalized = _normalize_history_filters(filters)
+        key = tuple(normalized.items())
         async with self._lock:
             if self._closed:
                 return {"status": "error", "error_kind": "closed", "message": "本次历史读取会话已经结束。"}
-            if self._history_pages >= MAX_HISTORY_PAGES:
-                return {"status": "error", "error_kind": "budget_exhausted",
-                        "message": "本次已读取3页历史，请缩小查询范围后再问。",
-                        "pages_read": self._history_pages, "ranges_read": list(self._history_ranges)}
-            self._history_pages += 1
+            task = self._history_tasks.get(key)
+            if task is None:
+                if self._history_pages >= MAX_HISTORY_PAGES:
+                    return {"status": "error", "error_kind": "budget_exhausted",
+                            "message": "本次已读取3页历史，请缩小查询范围后再问。",
+                            "pages_read": self._history_pages, "ranges_read": list(self._history_ranges)}
+                self._history_pages += 1
+                task = asyncio.create_task(
+                    self._read_history(normalized, page_number=self._history_pages)
+                )
+                self._history_tasks[key] = task
+        # Equivalent callers share this task. Cancelling one waiter must not
+        # cancel the repository operation for every other waiter.
+        return await asyncio.shield(task)
+
+    async def _read_history(
+        self, filters: dict[str, Any], *, page_number: int
+    ) -> dict[str, Any]:
+        raw = bool(filters.pop("raw"))
+        complete = raw or bool(filters["versions"]) or bool(filters["events"])
         try:
-            page = await self._repository.query_history(self._group_id, **filters)
+            page = await self._repository.query_history(
+                self._group_id, **filters, compact=not complete
+            )
         except Exception as exc:
             logger.warning("event=chat_history_read_failed error_type=%s", type(exc).__name__)
             return {"status": "error", "error_kind": "unavailable", "message": "历史读取暂不可用，请稍后重试。"}
-        if self._closed:
-            return {"status": "error", "error_kind": "closed", "message": "本次历史读取会话已经结束。"}
         ids = [_record_id(message) for message in page.get("messages", [])]
         valid_ids = [record_id for record_id in ids if record_id is not None]
-        self._retrieved_record_ids.update(valid_ids)
-        for message in page.get("messages", []):
-            record_id = _record_id(message)
-            if record_id is not None and message.get("derived", {}).get("has_image") and not _recalled(message):
-                self._image_record_ids.add(record_id)
-        self._history_ranges.append({
-            "first_record_id": min(valid_ids) if valid_ids else None,
-            "last_record_id": max(valid_ids) if valid_ids else None,
-            "count": len(ids), "has_more": page.get("has_more"),
-        })
-        return {**page, "status": "ok", "pages_read": self._history_pages,
-                "pages_remaining": MAX_HISTORY_PAGES - self._history_pages,
-                "records_complete": True}
+        async with self._lock:
+            if self._closed:
+                return {"status": "error", "error_kind": "closed", "message": "本次历史读取会话已经结束。"}
+            self._retrieved_record_ids.update(valid_ids)
+            for message in page.get("messages", []):
+                record_id = _record_id(message)
+                if record_id is not None and _has_image(message) and not _recalled(message):
+                    self._image_record_ids.add(record_id)
+            self._history_ranges.append({
+                "first_record_id": min(valid_ids) if valid_ids else None,
+                "last_record_id": max(valid_ids) if valid_ids else None,
+                "count": len(ids), "has_more": page.get("has_more"),
+            })
+        return {**page, "status": "ok", "pages_read": page_number,
+                "pages_remaining": MAX_HISTORY_PAGES - page_number,
+                "records_complete": complete,
+                "records_mode": "raw" if complete else "compact"}
 
     async def read_image(
         self, record_id: int, attachment_index: int = 0,
@@ -223,7 +270,8 @@ class GroupChatReadSession:
     async def close(self) -> None:
         async with self._lock:
             self._closed = True
-            tasks = list(self._image_tasks.values())
+            tasks = [*self._history_tasks.values(), *self._image_tasks.values()]
+            self._history_tasks.clear()
             self._image_tasks.clear()
         for task in tasks:
             if not task.done():
@@ -249,7 +297,7 @@ def _valid_history_filters(filters: dict[str, Any]) -> bool:
         elif key == "limit":
             if type(value) is not int or not 1 <= value <= MAX_HISTORY_PAGE_SIZE:
                 return False
-        elif key in {"versions", "events"}:
+        elif key in {"versions", "events", "raw"}:
             if type(value) is not bool:
                 return False
         elif not isinstance(value, str) or len(value) > 1000:
@@ -257,15 +305,35 @@ def _valid_history_filters(filters: dict[str, Any]) -> bool:
     return True
 
 
+def _normalize_history_filters(filters: dict[str, Any]) -> dict[str, Any]:
+    normalized = {
+        key: filters.get(key, default)
+        for key, default in _HISTORY_DEFAULTS.items()
+    }
+    # Version/event diagnostics already imply complete records, so an explicit
+    # raw flag is semantically redundant and must not consume another page.
+    if normalized["versions"] or normalized["events"]:
+        normalized["raw"] = True
+    return normalized
+
+
 def _record_id(wire: Any) -> int | None:
     if not isinstance(wire, dict):
         return None
-    value = wire.get("record", {}).get("record_id")
+    value = wire.get("record_id", wire.get("record", {}).get("record_id"))
     return value if _positive_int(value) else None
 
 
 def _recalled(wire: dict[str, Any]) -> bool:
-    return bool(wire.get("record", {}).get("recalled_at")) or wire.get("derived", {}).get("recall_state") == "confirmed"
+    return (
+        bool(wire.get("record", {}).get("recalled_at"))
+        or wire.get("recall_state", wire.get("derived", {}).get("recall_state"))
+        == "confirmed"
+    )
+
+
+def _has_image(wire: dict[str, Any]) -> bool:
+    return bool(wire.get("has_image", wire.get("derived", {}).get("has_image")))
 
 
 def _image_error(kind: str) -> tuple[dict[str, Any], tuple[ImageAsset, ...]]:

@@ -1,0 +1,2 @@
+{"file":".trellis/spec/backend/image-services.md","reason":"Verify web image limits without changing generation behavior"}
+{"file":".trellis/spec/backend/chat-read.md","reason":"Verify strict output, safe diagnostics and delivery metadata"}

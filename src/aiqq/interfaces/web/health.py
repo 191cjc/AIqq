@@ -15,17 +15,20 @@ class HealthHandler:
         database_is_open: Callable[[], bool],
         ai_backend: str,
         novelai_snapshot: Callable[[], dict[str, bool]] | None = None,
+        nai_v5_snapshot: Callable[[], dict[str, bool]] | None = None,
         message_storage_snapshot: Callable[[], Awaitable[dict[str, int]]] | None = None,
     ) -> None:
         self._gateway_snapshot = gateway_snapshot
         self._database_is_open = database_is_open
         self._ai_backend = ai_backend
         self._novelai_snapshot = novelai_snapshot
+        self._nai_v5_snapshot = nai_v5_snapshot
         self._message_storage_snapshot = message_storage_snapshot
 
     async def serve(self, _request: web.Request) -> web.Response:
         gateway = self._gateway_snapshot()
         novelai = self._novelai_snapshot() if self._novelai_snapshot else {}
+        nai_v5 = self._nai_v5_snapshot() if self._nai_v5_snapshot else {}
         healthy = bool(gateway.get("connected")) and self._database_is_open()
         storage: dict[str, object] = {}
         if self._message_storage_snapshot is not None:
@@ -45,6 +48,10 @@ class HealthHandler:
                 "novelai": {
                     "configured": bool(novelai.get("configured")),
                     "ready": bool(novelai.get("ready")),
+                },
+                "nai_v5": {
+                    "configured": bool(nai_v5.get("configured")),
+                    "ready": bool(nai_v5.get("ready")),
                 },
                 "conversation_context": "group_history_reference",
                 "shared_ai_thread": False,

@@ -1,19 +1,31 @@
-"""Persistent NovelAI style preferences owned by QQ senders."""
+"""Persistent, provider-specific NovelAI style preferences owned by QQ senders."""
 
 from __future__ import annotations
+
+from typing import Literal
 
 from .connection import SQLiteConnection
 
 
 class NovelAIStyleRepository:
-    def __init__(self, connection: SQLiteConnection) -> None:
+    def __init__(
+        self, connection: SQLiteConnection,
+        *, provider: Literal["novelai", "nai_v5"] = "novelai",
+    ) -> None:
+        tables = {
+            "novelai": "novelai_user_styles",
+            "nai_v5": "nai_v5_user_styles",
+        }
+        if provider not in tables:
+            raise ValueError("unsupported style provider")
         self._connection = connection
+        self._table = tables[provider]
 
     async def initialize(self) -> None:
         async with self._connection.transaction() as connection:
             await connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS novelai_user_styles (
+                f"""
+                CREATE TABLE IF NOT EXISTS {self._table} (
                     member_openid TEXT PRIMARY KEY,
                     prompt TEXT NOT NULL
                 )
@@ -25,7 +37,7 @@ class NovelAIStyleRepository:
             raise ValueError("member openid must not be empty")
         async with self._connection.read() as connection:
             async with connection.execute(
-                "SELECT prompt FROM novelai_user_styles WHERE member_openid = ?",
+                f"SELECT prompt FROM {self._table} WHERE member_openid = ?",
                 (member_openid,),
             ) as cursor:
                 row = await cursor.fetchone()
@@ -38,8 +50,8 @@ class NovelAIStyleRepository:
         async with self._connection.transaction() as connection:
             if normalized:
                 await connection.execute(
-                    """
-                    INSERT INTO novelai_user_styles (member_openid, prompt)
+                    f"""
+                    INSERT INTO {self._table} (member_openid, prompt)
                     VALUES (?, ?)
                     ON CONFLICT(member_openid) DO UPDATE SET prompt = excluded.prompt
                     """,
@@ -47,6 +59,6 @@ class NovelAIStyleRepository:
                 )
             else:
                 await connection.execute(
-                    "DELETE FROM novelai_user_styles WHERE member_openid = ?",
+                    f"DELETE FROM {self._table} WHERE member_openid = ?",
                     (member_openid,),
                 )

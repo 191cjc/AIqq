@@ -9,11 +9,15 @@ from typing import Any
 
 import aiosqlite
 
-from aiqq.logic.models import GroupHistoryMessage, GroupReplyContext
+from aiqq.logic.models import (
+    GroupHistoryMessage,
+    GroupReplyContext,
+    compact_chat_record,
+)
 
 from .connection import SQLiteConnection
 from .history import attachment_objects, decode_json, encode_json
-from .message_events import MessageEventStore, LOCAL_RECALL_EVENT
+from .message_events import MessageEventStore, LOCAL_RECALL_EVENT, LOCAL_MEMBER_RECALL_EVENT
 from .migrations import migrate_group_messages
 from .models import GroupMessageSummary, StoredGroupMessage
 
@@ -112,12 +116,29 @@ class GroupMessageRepository:
     async def mark_recalled(
         self, *, group_id: str, message_id: str, recalled_at: str | None = None
     ) -> bool:
+        return await self._mark_recalled(
+            LOCAL_RECALL_EVENT, group_id=group_id, message_id=message_id,
+            recalled_at=recalled_at,
+        )
+
+    async def mark_member_recalled(
+        self, *, group_id: str, message_id: str, recalled_at: str | None = None
+    ) -> bool:
+        return await self._mark_recalled(
+            LOCAL_MEMBER_RECALL_EVENT, group_id=group_id, message_id=message_id,
+            recalled_at=recalled_at,
+        )
+
+    async def _mark_recalled(
+        self, event_type: str, *, group_id: str, message_id: str,
+        recalled_at: str | None,
+    ) -> bool:
         if not group_id or not message_id:
             return False
         await self.initialize()
         return await self._events.add(
-            LOCAL_RECALL_EVENT,
-            {"t": LOCAL_RECALL_EVENT, "d": {
+            event_type,
+            {"t": event_type, "d": {
                 "group_openid": group_id, "id": message_id,
                 "recalled_at": recalled_at or _now(), "confirmation_source": "qq_api_success",
             }}, source="local_recall",
@@ -172,10 +193,7 @@ class GroupMessageRepository:
                 params,
             ) as cursor:
                 rows = await cursor.fetchall()
-            records = [
-                _row_to_message(row, await _wire_record(connection, row)) for row in reversed(rows)
-            ]
-        return tuple(_to_history_message(record) for record in records)
+        return tuple(_row_to_history_message(row) for row in reversed(rows))
 
     async def find_console_reply_context(
         self,
@@ -346,10 +364,16 @@ class GroupMessageRepository:
     async def get_current_for_reference(
         self, group_id: str, message_id: str
     ) -> GroupHistoryMessage | None:
-        wire = await self.get_full_message(group_id, message_id)
-        if wire is None:
+        if not group_id or not message_id:
             return None
-        return _to_history_message(_row_to_message(wire["record"], wire))
+        await self.initialize()
+        async with self._database.read() as connection:
+            row = await _fetch_one(
+                connection,
+                "SELECT * FROM group_messages WHERE group_openid=? AND message_id=?",
+                (group_id, message_id),
+            )
+        return _row_to_history_message(row) if row is not None else None
 
     async def has_before(self, group_id: str, record_id: int) -> bool:
         await self.initialize()
@@ -396,6 +420,7 @@ class GroupMessageRepository:
         keyword: str = "", sent_after: str = "", sent_before: str = "",
         limit: int = 50, versions: bool = False, before_version_id: int | None = None,
         events: bool = False, before_event_record_id: int | None = None,
+        compact: bool = False,
     ) -> dict[str, Any]:
         """Stable descending keyset paging; every branch binds the current group."""
         if not group_id:
@@ -426,7 +451,11 @@ class GroupMessageRepository:
                 rows = await cursor.fetchall()
             page = rows[:safe_limit]
             result = {
-                "messages": [await _wire_record(connection, row) for row in page],
+                "messages": (
+                    [compact_chat_record(_row_to_history_message(row)) for row in page]
+                    if compact and not versions and not events
+                    else [await _wire_record(connection, row) for row in page]
+                ),
                 "has_more": len(rows) > safe_limit,
                 "next_cursor": page[-1]["record_id"] if len(rows) > safe_limit else None,
             }
@@ -532,7 +561,10 @@ class GroupMessageRepository:
 
 
 
-def _to_history_message(record: StoredGroupMessage) -> GroupHistoryMessage:
+def _row_to_history_message(row: Any) -> GroupHistoryMessage:
+    record = _row_to_message(row)
+    image_indexes = _image_attachment_indexes(record.payload)
+    keys = set(row.keys())
     return GroupHistoryMessage(
         record_id=record.record_id,
         role="assistant" if record.is_bot else "user",
@@ -541,9 +573,25 @@ def _to_history_message(record: StoredGroupMessage) -> GroupHistoryMessage:
         content=record.content,
         message_type=record.message_type,
         reply_summary=_extract_reply_summary(record.payload),
-        has_image=_has_image(record.payload),
-        record=record.record,
+        has_image=bool(image_indexes),
+        image_attachment_indexes=image_indexes,
+        recall_state=(
+            "confirmed"
+            if record.recalled_at
+            else row["recall_state"] if "recall_state" in keys else "unobserved"
+        ),
+        progress=record.event_type == "BOT_PROGRESS_MESSAGE",
     )
+
+
+def _image_attachment_indexes(payload: dict[str, Any]) -> tuple[int, ...]:
+    count = sum(
+        1
+        for _path, metadata in attachment_objects(payload)
+        if isinstance(metadata.get("content_type"), str)
+        and metadata["content_type"].lower().startswith("image/")
+    )
+    return tuple(range(count))
 
 
 def _extract_reply_summary(payload: dict[str, Any]) -> str:

@@ -33,7 +33,7 @@ from aiqq.logic.models import (
     ImageAction,
     ImageAsset,
 )
-from aiqq.services.images.validation import MAX_IMAGE_BYTES
+from aiqq.services.images.validation import InvalidImage, MAX_IMAGE_BYTES, validate_image
 
 
 logger = logging.getLogger(__name__)
@@ -77,7 +77,7 @@ class GPTImageService:
         *,
         api_key: str,
         base_url: str = "https://api.openai.com/v1",
-        model: str = "gpt-image-2",
+        model: str = "gpt-image-2.5-flare",
         timeout_seconds: int = 240,
         client: AsyncOpenAI | Any | None = None,
     ) -> None:
@@ -118,15 +118,13 @@ class GPTImageService:
         diagnostics: dict[str, object] = {}
         _log_event("gpt_image_started", fields)
         try:
-            image_size, target_size = _resolve_image_size(action)
             request_params = {
                 "model": self.model,
                 "prompt": SAFE_IMAGE_INSTRUCTION + action.prompt,
                 "n": 1,
-                "size": image_size,
+                "size": "auto",
                 "quality": IMAGE_QUALITY,
-                "output_format": "jpeg",
-                "output_compression": OUTPUT_COMPRESSION,
+                "response_format": "b64_json",
             }
             if operation == "edit":
                 if reference_image is None:
@@ -138,6 +136,16 @@ class GPTImageService:
                     raise GPTImageError(
                         "reference image format is unsupported", kind="invalid_request"
                     )
+                try:
+                    validated_reference = validate_image(reference_image.data)
+                except InvalidImage as exc:
+                    raise GPTImageError(
+                        "reference image is invalid", kind="invalid_request"
+                    ) from exc
+                fields.update(
+                    reference_width=validated_reference.width,
+                    reference_height=validated_reference.height,
+                )
                 request = self._client.images.with_raw_response.edit
                 request_params.update(
                     image=(
@@ -150,6 +158,7 @@ class GPTImageService:
             else:
                 request = self._client.images.with_raw_response.generate
                 request_params["moderation"] = "auto"
+            fields["request_size"] = request_params["size"]
             for retry_index in range(len(BAD_GATEWAY_RETRY_DELAYS) + 1):
                 try:
                     raw = await request(**request_params)
@@ -182,9 +191,8 @@ class GPTImageService:
                 raise GPTImageError(
                     "GPT image response is invalid", kind="invalid_response"
                 ) from exc
-            asset = await asyncio.to_thread(
-                _decode_and_normalize, response, target_size
-            )
+            asset = await asyncio.to_thread(_decode_image, response)
+            fields.update(output_width=asset.width, output_height=asset.height)
             outcome = "succeeded"
             kind = "none"
             return asset
@@ -355,11 +363,8 @@ def _error_diagnostics(
     return fields
 
 
-def _resolve_image_size(
-    action: ImageAction,
-) -> tuple[GPTImageSize, tuple[int, int]]:
-    target_size = action.target_dimensions
-    target_width, target_height = target_size
+def _resolve_image_size(action: ImageAction) -> GPTImageSize:
+    target_width, target_height = action.target_dimensions
 
     def distance(image_size: GPTImageSize) -> tuple[float, bool]:
         native_width, native_height = GPT_IMAGE_DIMENSIONS[image_size]
@@ -368,13 +373,11 @@ def _resolve_image_size(
         )
         return ratio_distance, image_size != DEFAULT_GPT_IMAGE_SIZE
 
-    image_size = min(GPT_IMAGE_DIMENSIONS, key=distance)
-    return image_size, target_size
+    return min(GPT_IMAGE_DIMENSIONS, key=distance)
 
 
-def _decode_and_normalize(
-    response: Any, target_size: tuple[int, int]
-) -> ImageAsset:
+def _decode_image(response: Any) -> ImageAsset:
+    """Validate the returned image without altering its bytes or canvas."""
     items = getattr(response, "data", None)
     if not isinstance(items, list) or not items:
         raise GPTImageError("GPT image response contains no image", kind="invalid_response")
@@ -387,6 +390,15 @@ def _decode_and_normalize(
         raise GPTImageError("GPT image response is invalid Base64", kind="invalid_response") from exc
     if not data or len(data) > MAX_IMAGE_BYTES:
         raise GPTImageError("GPT image response size is invalid", kind="invalid_response")
+    try:
+        return validate_image(data)
+    except InvalidImage as exc:
+        raise GPTImageError("GPT image response cannot be decoded", kind="invalid_response") from exc
+
+
+def _decode_and_normalize(response: Any) -> ImageAsset:
+    """Legacy Responses adapter: convert to RGB JPEG without changing composition."""
+    data = _decode_image(response).data
     try:
         with Image.open(BytesIO(data)) as source:
             width, height = source.size
@@ -401,17 +413,8 @@ def _decode_and_normalize(
                 rgb = background.convert("RGB")
             else:
                 rgb = oriented.convert("RGB")
-            fitted = ImageOps.contain(rgb, target_size, Image.Resampling.LANCZOS)
-            normalized = Image.new("RGB", target_size, "white")
-            normalized.paste(
-                fitted,
-                (
-                    (target_size[0] - fitted.width) // 2,
-                    (target_size[1] - fitted.height) // 2,
-                ),
-            )
             output = BytesIO()
-            normalized.save(
+            rgb.save(
                 output,
                 format="JPEG",
                 quality=OUTPUT_COMPRESSION,
@@ -424,4 +427,4 @@ def _decode_and_normalize(
     normalized_data = output.getvalue()
     if not normalized_data or len(normalized_data) > MAX_IMAGE_BYTES:
         raise GPTImageError("normalized GPT image size is invalid", kind="invalid_response")
-    return ImageAsset(normalized_data, "image/jpeg", *target_size)
+    return ImageAsset(normalized_data, "image/jpeg", *rgb.size)

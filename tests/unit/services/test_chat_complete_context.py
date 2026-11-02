@@ -18,7 +18,7 @@ from tests.unit.services.test_chat_read import image_bytes
 
 
 ANSWER = json.dumps({"full_text": "answer", "summary": "回答", "image_action": None,
-                     "selected_web_image_url": None, "sources": []})
+                     "selected_web_image_urls": [], "sources": []})
 
 
 class CompleteContextTests(unittest.IsolatedAsyncioTestCase):
@@ -57,7 +57,7 @@ class CompleteContextTests(unittest.IsolatedAsyncioTestCase):
         return await self.workflow.run(group_id="g", before_message_id=message,
                                        conversation_key="key", user_input="查看记录")
 
-    async def test_full_fifty_plus_current_flow_keeps_unknown_columns_payload_and_whitespace(self):
+    async def test_compact_ten_plus_current_is_semantic_and_ninety_percent_smaller(self):
         async with self.connection.transaction() as connection:
             await connection.execute("ALTER TABLE group_messages ADD COLUMN future_flag TEXT DEFAULT 'new field'")
         for i in range(1, 53):
@@ -67,20 +67,54 @@ class CompleteContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "ok")
         payload = json.loads(self.backend.run.await_args.kwargs["model_input"])
         records = payload["reference_material"]["group_messages"]
-        self.assertEqual(len(records), 50)
-        self.assertEqual([r["record"]["message_id"] for r in records], [f"m{i}" for i in range(2, 52)])
-        self.assertGreater(sum(len(r["record"]["content"]) for r in records), 10000)
+        self.assertEqual(len(records), 10)
+        expected_keys = {
+            "record_id", "role", "sender_name", "sent_at", "content",
+            "message_type", "reply_summary", "has_image",
+            "image_attachment_indexes", "recall_state", "progress",
+        }
+        self.assertTrue(all(set(record) == expected_keys for record in records))
+        self.assertEqual([r["record_id"] for r in records], list(range(42, 52)))
+        self.assertGreater(sum(len(r["content"]) for r in records), 2500)
         self.assertTrue(payload["reference_material"]["scope"]["has_more"])
         for record in records:
-            expected = await self.repository.get_full_record("g", record["record"]["record_id"])
-            self.assertEqual(record, expected)
-            self.assertEqual(record["record"]["future_flag"], "new field")
-            self.assertIn("\n\n  ", record["record"]["content"])
-            self.assertEqual(len(record["payload"]["attachments"]), 23)
-            self.assertEqual(record["payload"]["nested_unknown"]["reference"]["items"], [None, False, 0, ""])
+            self.assertIn("\n\n  ", record["content"])
+            self.assertTrue(record["has_image"])
+            self.assertEqual(record["image_attachment_indexes"], list(range(23)))
+            self.assertEqual(record["recall_state"], "unobserved")
+            self.assertFalse(record["progress"])
         current = payload["current_message"]
-        self.assertEqual(current, await self.repository.get_full_message("g", "m52"))
-        self.assertEqual(len(current["payload"]["attachments"]), 23)
+        self.assertEqual(set(current), expected_keys)
+        self.assertEqual(current["record_id"], 52)
+        self.assertEqual(current["content"], "查看记录")
+        self.assertNotIn("user_input", payload)
+        compact_bytes = len(json.dumps(payload, ensure_ascii=False).encode())
+        complete_records = [
+            await self.repository.get_full_message("g", f"m{i}")
+            for i in range(42, 52)
+        ]
+        complete_payload = {
+            "reference_material": {"group_messages": complete_records},
+            "user_input": "查看记录",
+            "current_message": await self.repository.get_full_message("g", "m52"),
+        }
+        complete_bytes = len(json.dumps(complete_payload, ensure_ascii=False).encode())
+        self.assertLessEqual(compact_bytes, complete_bytes * 0.1)
+        self.assertEqual(
+            self.backend.run.await_args.kwargs["model_input"].count("查看记录"), 1
+        )
+
+    async def test_missing_current_lookup_still_serializes_current_text_once(self):
+        await self.event(1)
+
+        result = await self.run_workflow("missing-message")
+
+        self.assertEqual(result.status, "ok")
+        model_input = self.backend.run.await_args.kwargs["model_input"]
+        payload = json.loads(model_input)
+        self.assertEqual(payload["current_message"]["content"], "查看记录")
+        self.assertIsNone(payload["current_message"]["record_id"])
+        self.assertEqual(model_input.count("查看记录"), 1)
 
     async def test_context_capacity_error_is_explicit_without_reduced_retry(self):
         await self.event(1)
@@ -130,7 +164,7 @@ class CompleteContextTests(unittest.IsolatedAsyncioTestCase):
                         await session.read_image(index + 1)
                     return AgentTurnResult(json.dumps({
                         "full_text": model_text, "summary": "model summary", "image_action": None,
-                        "selected_web_image_url": None, "sources": [],
+                        "selected_web_image_urls": [], "sources": [],
                     }))
 
                 self.backend.run.side_effect = respond

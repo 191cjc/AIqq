@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 from typing import Any, Protocol
 
 import aiohttp
@@ -18,6 +19,7 @@ from .validation import InvalidImage, decode_base64_image
 logger = logging.getLogger(__name__)
 MCP_PROTOCOL_VERSION = "2025-06-18"
 NOVELAI_MODEL = "v4.5-full"
+NAI_V5_MODEL = "nai-diffusion-5-full"
 NOVELAI_IMAGE_SIZES = {
     "square": (1024, 1024),
     "portrait": (832, 1216),
@@ -31,6 +33,28 @@ SAFE_NEGATIVE_PROMPT = (
     "sexual_intercourse, masturbation, sexual_fluids, erotic, suggestive, "
     "fetish, lingerie, underwear, see-through_clothes, cleavage, loli, shota, "
     "child sexualization"
+)
+# Keep v5's requested exclusions and weights independent of the legacy preset.
+NAI_V5_NEGATIVE_PROMPT = (
+    "nsfw, explicit, nude, naked, nipples, areolae, genitals, sex, "
+    "sexual_intercourse, masturbation, sexual_fluids, erotic, suggestive, fetish, "
+    "lingerie, underwear, see-through_clothes, child sexualization, lowres, "
+    "artistic error, film grain, scan artifacts, {worst quality}, {bad quality}, "
+    "jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, "
+    "screentone, multiple views, logo, too many watermarks, negative space, "
+    "blank page, bar censor, censored, {crotchless}, {bad}, error, fewer, extra, "
+    "missing, watermark, {unfinished}, displeasing, signature, extra digits, "
+    "username, scan, panties, [abstract], bad anatomy, bad hands, @_@, "
+    "mismatched pupils, {cubism}, {normal quality}, {{{{unskillful}}}}, "
+    "{incomplete}, {{failure}}, {inferior}, {terrifying}, {haunting}, "
+    "{bad joint}, {monster}, {ugly}, {retro artstyle}, {key}, low quality, "
+    "disfigured, poorly drawn, deformed, mutation, fused fingers, fused limb, "
+    "extra limb, missing fingers, missing limb, missing digit, missing legs, "
+    "disappearing arms, extra limbs, aged up, old, long neck, long body, rib, "
+    "dusty sunbeams, depth of field, bokeh, out of focus, blurry, text, title, "
+    "breast apart, lineart, dark areolae, simple illustration, "
+    "3::anatomical nonsense::, upscaled, fewer details, cheesy, unsatisfactory, "
+    "inadequate, deficient, subpar, poor, artist collaboration, artist:milkpanda"
 )
 
 
@@ -307,6 +331,98 @@ class NovelAIService:
 
     async def close(self) -> None:
         self._supports_steps = None
+        if self._client is not None:
+            await self._client.close()
+
+
+class NaiV5Service:
+    """V5 generation through the separately deployed NovelAI Image MCP server."""
+
+    def __init__(
+        self, client: NovelAIMCPTransport | None, *, max_concurrent: int = 1
+    ) -> None:
+        if max_concurrent < 1:
+            raise ValueError("Nai v5 concurrency must be positive")
+        self._client = client
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._ready = False
+
+    @property
+    def is_configured(self) -> bool:
+        return self._client is not None
+
+    @property
+    def is_ready(self) -> bool:
+        return self._ready
+
+    async def initialize(self) -> None:
+        await self.check_connection()
+
+    async def check_connection(self) -> bool:
+        self._ready = False
+        if self._client is None:
+            logger.warning("event=nai_v5_connection_failed error_kind=not_configured")
+            return False
+        try:
+            response = await self._client.list_tools()
+            tools = response.get("tools", [])
+            if isinstance(tools, list):
+                self._ready = any(
+                    isinstance(tool, dict)
+                    and tool.get("name") == "generate_image"
+                    and isinstance(tool.get("inputSchema"), dict)
+                    and isinstance(tool["inputSchema"].get("properties"), dict)
+                    and {"prompt", "model", "quality", "n_samples"}.issubset(
+                        tool["inputSchema"]["properties"]
+                    )
+                    for tool in tools
+                )
+        except Exception as exc:
+            logger.warning(
+                "event=nai_v5_connection_failed error_kind=not_ready error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        if not self._ready:
+            logger.warning("event=nai_v5_connection_failed error_kind=tool_unavailable")
+        return self._ready
+
+    async def generate(
+        self, prompt: str, *, orientation: str = "square"
+    ) -> ImageAsset:
+        if self._client is None:
+            raise NovelAIError("Nai v5 service is not configured", kind="not_configured")
+        if not self._ready:
+            raise NovelAIError("Nai v5 service is not ready", kind="not_ready")
+        try:
+            width, height = NOVELAI_IMAGE_SIZES[orientation]
+        except KeyError as exc:
+            raise NovelAIError("Nai v5 image orientation is unsupported") from exc
+        arguments = {
+            "prompt": f"{SAFE_PROMPT_PREFIX}, {prompt}",
+            "negative_prompt": NAI_V5_NEGATIVE_PROMPT,
+            "model": NAI_V5_MODEL,
+            "width": width,
+            "height": height,
+            "steps": NOVELAI_STEPS,
+            # The deployed service forwards 0 literally despite its docs.
+            "seed": secrets.randbelow(2**32 - 1) + 1,
+            "n_samples": 1,
+            "quality": False,
+            "cfg_rescale": NOVELAI_CFG_RESCALE,
+        }
+        async with self._semaphore:
+            logger.info("event=nai_v5_generation_requested seed=%d", arguments["seed"])
+            result = await self._client.call_tool("generate_image", arguments)
+        if isinstance(result, dict) and result.get("isError") is True:
+            raise NovelAIError("Nai v5 generation failed")
+        image = _find_inline_image(result)
+        if image is None:
+            raise NovelAIError("Nai v5 response contains no image")
+        return image
+
+    async def close(self) -> None:
+        self._ready = False
         if self._client is not None:
             await self._client.close()
 

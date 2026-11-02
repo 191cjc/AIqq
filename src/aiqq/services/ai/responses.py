@@ -20,10 +20,11 @@ from openai import (
 from aiqq.exceptions import AgentUnavailable, AgentContextTooLarge
 from aiqq.logic.chat_read import ChatReadSession
 from aiqq.logic.models import ImageAsset
-from aiqq.logic.ports import AgentTurnResult, ProgressCallback
+from aiqq.logic.ports import AITurnPurpose, AgentTurnResult, ProgressCallback
 from aiqq.services.images.validation import InvalidImage, decode_base64_image
 from aiqq.services.ai.chat_runtime import MAX_VISUAL_INPUTS, MAX_TOOL_ROUNDS
 from aiqq.services.ai.errors import is_context_limit_error
+from aiqq.services.ai.turn_metrics import AITurnMetric
 
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ class ResponsesBackend:
     async def run(
         self,
         *,
+        purpose: AITurnPurpose,
         instructions: str,
         model_input: str,
         output_schema: Mapping[str, Any],
@@ -64,6 +66,68 @@ class ResponsesBackend:
         on_progress: ProgressCallback | None = None,
         input_images: Sequence[ImageAsset] = (),
         chat_read_session: ChatReadSession | None = None,
+    ) -> AgentTurnResult:
+        metric = AITurnMetric(
+            purpose=purpose,
+            backend="responses",
+            model=self._model,
+            model_input=model_input,
+            output_limit_mode="enforced_responses",
+        )
+        counters: dict[str, int | str] = {
+            "provider_requests": 0,
+            "tool_calls": 0,
+            "history_pages": 0,
+            "image_reads": 0,
+            "search_requests": 0,
+        }
+        usage: Mapping[str, Any] | None = None
+        observations: dict[str, Any] = {}
+        try:
+            result = await self._run_impl(
+                instructions=instructions,
+                model_input=model_input,
+                output_schema=output_schema,
+                enable_web_search=enable_web_search,
+                enable_gpt_image_skill=enable_gpt_image_skill,
+                on_progress=on_progress,
+                input_images=input_images,
+                chat_read_session=chat_read_session,
+                counters=counters,
+                observations=observations,
+            )
+            usage = result.usage
+        except asyncio.CancelledError as exc:
+            _capture_session_counts(counters, chat_read_session)
+            metric.finish(
+                "cancelled", usage=usage or observations.get("usage"), counters=counters,
+                error_type=type(exc).__name__,
+            )
+            raise
+        except BaseException as exc:
+            _capture_session_counts(counters, chat_read_session)
+            metric.finish(
+                "failure", usage=usage or observations.get("usage"), counters=counters,
+                error_type=type(exc).__name__,
+            )
+            raise
+        _capture_session_counts(counters, chat_read_session)
+        metric.finish("success", usage=usage, counters=counters)
+        return result
+
+    async def _run_impl(
+        self,
+        *,
+        instructions: str,
+        model_input: str,
+        output_schema: Mapping[str, Any],
+        enable_web_search: bool = False,
+        enable_gpt_image_skill: bool = False,
+        on_progress: ProgressCallback | None = None,
+        input_images: Sequence[ImageAsset] = (),
+        chat_read_session: ChatReadSession | None = None,
+        counters: dict[str, int | str],
+        observations: dict[str, Any],
     ) -> AgentTurnResult:
         del enable_gpt_image_skill, on_progress
         schema = _normalize_output_schema(output_schema)
@@ -95,7 +159,9 @@ class ResponsesBackend:
             request["tools"] = tools
         try:
             async with self._semaphore:
-                response = await self._run_with_reads(request, chat_read_session, len(input_images))
+                response = await self._run_with_reads(
+                    request, chat_read_session, len(input_images), counters
+                )
         except (APIConnectionError, APIStatusError, APITimeoutError, RateLimitError) as exc:
             if is_context_limit_error(exc):
                 raise AgentContextTooLarge("complete chat context exceeds model capacity") from exc
@@ -109,6 +175,9 @@ class ResponsesBackend:
             )
             raise AgentUnavailable("Responses API request failed") from exc
 
+        usage_value = getattr(response, "usage", None)
+        usage = _model_dump(usage_value)
+        observations["usage"] = usage
         text = getattr(response, "output_text", "")
         if not isinstance(text, str) or not text.strip():
             raise AgentUnavailable("Responses API returned no structured text")
@@ -126,8 +195,6 @@ class ResponsesBackend:
                 images.append(decode_base64_image(encoded))
             except InvalidImage:
                 image_error = "图片生成结果无法使用。"
-        usage_value = getattr(response, "usage", None)
-        usage = _model_dump(usage_value)
         return AgentTurnResult(
             text=text.strip(),
             images=tuple(images),
@@ -135,10 +202,21 @@ class ResponsesBackend:
             image_error=image_error,
         )
 
-    async def _run_with_reads(self, request, session, image_count):
+    async def _run_with_reads(self, request, session, image_count, counters):
         for round_number in range(MAX_TOOL_ROUNDS + 1):
+            counters["provider_requests"] += 1
             response = await self._client.responses.create(**request)
-            calls = [item for item in getattr(response, "output", ())
+            output = tuple(getattr(response, "output", ()))
+            search_calls = sum(
+                _field(item, "type") in {"web_search", "web_search_call"}
+                for item in output
+            )
+            image_calls = sum(
+                _field(item, "type") == "image_generation_call" for item in output
+            )
+            counters["search_requests"] += search_calls
+            counters["tool_calls"] += search_calls + image_calls
+            calls = [item for item in output
                      if _field(item, "type") == "function_call"]
             if not calls:
                 return response
@@ -150,8 +228,9 @@ class ResponsesBackend:
             else:
                 history = list(history)
             history.extend(_model_dump(item) if not isinstance(item, dict) else item
-                           for item in getattr(response, "output", ()))
+                           for item in output)
             for call in calls:
+                counters["tool_calls"] += 1
                 name = _field(call, "name")
                 try:
                     arguments = json.loads(_field(call, "arguments"))
@@ -159,9 +238,11 @@ class ResponsesBackend:
                         raise ValueError("invalid arguments")
                     arguments = {key: value for key, value in arguments.items() if value is not None}
                     if name == "read_history":
+                        counters["history_pages"] += 1
                         metadata = await session.read_history(**arguments)
                         images = ()
                     elif name == "read_image":
+                        counters["image_reads"] += 1
                         metadata, images = await session.read_image(**arguments)
                     else:
                         raise AgentUnavailable("unexpected chat tool")
@@ -236,6 +317,19 @@ def _model_dump(value: Any) -> Mapping[str, Any] | None:
     return dump() if callable(dump) else None
 
 
+def _capture_session_counts(
+    counters: dict[str, int | str], session: ChatReadSession | None
+) -> None:
+    if session is None:
+        return
+    counters["history_pages"] = getattr(
+        session, "history_page_count", counters["history_pages"]
+    )
+    counters["image_reads"] = getattr(
+        session, "image_read_count", counters["image_reads"]
+    )
+
+
 def _read_tools() -> list[dict[str, Any]]:
     history = {
         "record_id": {"type": ["integer", "null"]},
@@ -250,6 +344,7 @@ def _read_tools() -> list[dict[str, Any]]:
         "before_version_id": {"type": ["integer", "null"]},
         "events": {"type": ["boolean", "null"]},
         "before_event_record_id": {"type": ["integer", "null"]},
+        "raw": {"type": ["boolean", "null"]},
     }
     image = {
         "record_id": {"type": "integer"},
@@ -260,6 +355,6 @@ def _read_tools() -> list[dict[str, Any]]:
              "strict": True, "parameters": {"type": "object", "properties": properties,
                  "required": list(properties), "additionalProperties": False}}
             for name, description, properties in (
-                ("read_history", "Read complete earlier records from this group only, with stable pagination.", history),
+                ("read_history", "Read compact earlier same-group records with stable pagination; use raw only for diagnostics.", history),
                 ("read_image", "Download the selected same-group attachment on demand and inspect returned pixels.", image),
             )]

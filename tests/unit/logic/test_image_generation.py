@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from aiqq.exceptions import ImageAuditUnavailable, ImageGenerationUnavailable
+from aiqq.logic.image_audit import ImageAuditPolicy
 from aiqq.logic.image_generation import GPTImageWorkflow
 from aiqq.logic.image_quota import ImageQuotaManager
 from aiqq.logic.models import (
@@ -66,6 +67,53 @@ def audit(*, safe=True, effective=True, orientation="square"):
 
 
 class GPTImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exempt_sender_skips_audit_and_still_uses_normal_generation_and_quota(self):
+        auditor = AsyncMock()
+        auditor.audit.side_effect = ImageAuditUnavailable("audit offline")
+        images = FakeImageService()
+        usage = FakeImageUsage()
+        workflow = GPTImageWorkflow(
+            prompt_auditor=auditor, image_service=images, image_usage=usage,
+            audit_policy=ImageAuditPolicy(frozenset({"trusted"})),
+        )
+        started = AsyncMock()
+        result = await workflow.run(
+            " white cat ", conversation_key="group:g:member:trusted",
+            member_openid="trusted", on_image_start=started,
+        )
+        self.assertEqual(result.status, "ok")
+        auditor.audit.assert_not_awaited()
+        started.assert_awaited_once_with()
+        self.assertEqual(images.calls, [ImageAction("generate", "white cat")])
+        self.assertEqual(usage.reserved, ["group:g:member:trusted"])
+        self.assertEqual(usage.recorded, usage.reserved)
+        self.assertEqual(usage.finished, usage.reserved)
+        # A matching-looking key cannot exempt a different or absent sender.
+        for member in ("other", ""):
+            result = await workflow.run(
+                "white cat", conversation_key="group:g:member:trusted", member_openid=member,
+            )
+            self.assertEqual(result.error_code, "image_audit_unavailable")
+        self.assertEqual(auditor.audit.await_count, 2)
+        self.assertEqual(len(images.calls), 1)
+
+    async def test_exempt_gpt_requests_still_reject_empty_input_and_exhausted_quota(self):
+        auditor = AsyncMock()
+        images = FakeImageService()
+        usage = FakeImageUsage(ImageUsageDecision(False, "daily_limit", 100))
+        workflow = GPTImageWorkflow(
+            prompt_auditor=auditor, image_service=images, image_usage=usage,
+            audit_policy=ImageAuditPolicy(frozenset({"trusted"})),
+        )
+        empty = await workflow.run(" \n ", conversation_key="key", member_openid="trusted")
+        denied = await workflow.run("white cat", conversation_key="key", member_openid="trusted")
+        self.assertEqual(empty.status, "rejected")
+        self.assertEqual(denied.status, "rejected")
+        auditor.audit.assert_not_awaited()
+        self.assertEqual(usage.reserved, ["key"])
+        self.assertEqual(usage.recorded, [])
+        self.assertEqual(images.calls, [])
+
     async def test_safe_prompt_generates_one_image(self):
         images = FakeImageService()
         usage = FakeImageUsage()
@@ -132,6 +180,28 @@ class GPTImageWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(result.status, "ok")
             self.assertEqual(images.calls, [])
             self.assertEqual(usage.reserved, [])
+
+    async def test_rejected_image_summary_shows_reason_and_preserves_long_detail(self):
+        reason = "画面仅包含参数，缺少可绘制的主体或场景。" * 4
+        auditor = FakeAuditor(ImagePromptAuditResult(
+            safe=True, effective=False, category="safe", reason=reason,
+            suggested_prompt="white cat, safe, sfw", orientation="square",
+        ))
+        images = FakeImageService()
+        usage = FakeImageUsage()
+
+        result = await GPTImageWorkflow(
+            prompt_auditor=auditor, image_service=images, image_usage=usage,
+        ).run("parameters only", conversation_key="key")
+
+        self.assertEqual(result.status, "rejected")
+        self.assertIn(reason, result.full_text)
+        self.assertIn("可改为：white cat, safe, sfw", result.full_text)
+        self.assertTrue(result.summary.startswith("审核未通过：画面仅包含参数"))
+        self.assertTrue(result.summary.endswith("…"))
+        self.assertLessEqual(len(result.summary), 50)
+        self.assertEqual(images.calls, [])
+        self.assertEqual(usage.reserved, [])
 
     async def test_quota_denial_never_calls_image_api(self):
         images = FakeImageService()

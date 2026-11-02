@@ -117,6 +117,7 @@ class NovelAIPromptAgent:
         tag_reference = await self._search_tags(queries)
         try:
             result = await self._backend.run(
+                purpose="novelai_author",
                 instructions=instructions,
                 model_input=json.dumps(
                     {**payload, "tag_reference": tag_reference},
@@ -141,6 +142,7 @@ class NovelAIPromptAgent:
     async def _plan_queries(self, payload: dict[str, object]) -> tuple[str, ...]:
         try:
             result = await self._backend.run(
+                purpose="novelai_plan",
                 instructions=TAG_PLANNING_INSTRUCTIONS,
                 model_input=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
                 output_schema=NOVELAI_TAG_QUERIES_OUTPUT_SCHEMA,

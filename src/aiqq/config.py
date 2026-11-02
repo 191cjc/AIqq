@@ -72,6 +72,12 @@ class ImageConfig:
     novelai_mcp_token_file: Path | None
     novelai_timeout_seconds: int
     novelai_max_concurrent: int
+    nai_v5_mcp_url: str
+    nai_v5_mcp_token: str
+    nai_v5_mcp_token_file: Path | None
+    nai_v5_daily_limit: int
+    nai_v5_whitelist: frozenset[str]
+    image_audit_whitelist: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -101,6 +107,20 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class GPTUsageAccountConfig:
+    member_openid: str
+    label: str
+    api_key: str
+
+
+@dataclass(frozen=True)
+class GPTUsageConfig:
+    base_url: str
+    accounts: tuple[GPTUsageAccountConfig, ...]
+    admin_member_ids: frozenset[str]
+
+
+@dataclass(frozen=True)
 class AppConfig:
     qq: QQConfig
     ai: AIConfig
@@ -109,6 +129,7 @@ class AppConfig:
     storage: StorageConfig
     web: WebConfig
     logging: LoggingConfig
+    gpt_usage: GPTUsageConfig = GPTUsageConfig("https://api.airoo.cc/v1", (), frozenset())
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "AppConfig":
@@ -137,6 +158,7 @@ class AppConfig:
         )
 
         token_file_value = _text(values, "NOVELAI_MCP_TOKEN_FILE", "")
+        nai_v5_token_file_value = _text(values, "NAI_V5_MCP_TOKEN_FILE", "")
         admin_token_file_value = _text(values, "AIQQ_ADMIN_TOKEN_FILE", "")
         return cls(
             qq=QQConfig(
@@ -207,7 +229,7 @@ class AppConfig:
             images=ImageConfig(
                 api_key=image_api_key,
                 base_url=image_base_url,
-                model=_text(values, "OPENAI_IMAGE_MODEL", "gpt-image-2") or "gpt-image-2",
+                model=_text(values, "OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare") or "gpt-image-2.5-flare",
                 driver_model=_text(
                     values, "OPENAI_IMAGE_DRIVER_MODEL", "gpt-6-astra"
                 ) or "gpt-6-astra",
@@ -234,6 +256,20 @@ class AppConfig:
                 novelai_max_concurrent=_integer(
                     values, "AIQQ_NOVELAI_MAX_CONCURRENT", 1, 1, 3
                 ),
+                nai_v5_mcp_url=_https_url(
+                    _text(values, "NAI_V5_MCP_URL", "https://www.fsstudy.com.cn/novel-ai-v5"),
+                    "NAI_V5_MCP_URL",
+                ),
+                nai_v5_mcp_token=_text(values, "NAI_V5_MCP_TOKEN", ""),
+                nai_v5_mcp_token_file=(
+                    Path(nai_v5_token_file_value).expanduser()
+                    if nai_v5_token_file_value else None
+                ),
+                nai_v5_daily_limit=_integer(
+                    values, "AIQQ_NAI_V5_DAILY_LIMIT", 10, 1, 1000
+                ),
+                nai_v5_whitelist=_member_ids(values, "AIQQ_NAI_V5_WHITELIST"),
+                image_audit_whitelist=_member_ids(values, "AIQQ_IMAGE_AUDIT_WHITELIST"),
             ),
             storage=StorageConfig(
                 state_database_path=_path(
@@ -269,6 +305,14 @@ class AppConfig:
                 file_path=_path(values, "AIQQ_LOG_FILE", "aiqq.log"),
                 backup_days=_integer(values, "AIQQ_LOG_BACKUP_DAYS", 14, 1, 90),
             ),
+            gpt_usage=GPTUsageConfig(
+                base_url=_https_url(
+                    _text(values, "AIQQ_GPT_USAGE_BASE_URL", "") or base_url,
+                    "AIQQ_GPT_USAGE_BASE_URL",
+                ),
+                accounts=_gpt_usage_accounts(values, "AIQQ_GPT_USAGE_ACCOUNTS"),
+                admin_member_ids=_member_ids(values, "AIQQ_GPT_USAGE_ADMINS"),
+            ),
         )
 
 
@@ -281,6 +325,43 @@ def _required(values: Mapping[str, str], name: str) -> str:
     if not value:
         raise ConfigurationError(f"missing required environment variable: {name}")
     return value
+
+
+def _member_ids(values: Mapping[str, str], name: str) -> frozenset[str]:
+    raw = _text(values, name, "")
+    if not raw:
+        return frozenset()
+    members = [item.strip() for item in raw.split(",")]
+    if any(not item or len(item) > 256 or any(char.isspace() for char in item) for item in members):
+        raise ConfigurationError(f"{name} must contain comma-separated member IDs")
+    return frozenset(members)
+
+
+def _gpt_usage_accounts(
+    values: Mapping[str, str], name: str
+) -> tuple[GPTUsageAccountConfig, ...]:
+    """Parse ``openid|label|key`` entries separated by ``;``."""
+    raw = _text(values, name, "")
+    if not raw:
+        return ()
+    accounts = []
+    seen: set[str] = set()
+    for entry in raw.split(";"):
+        if not entry.strip():
+            continue
+        parts = [part.strip() for part in entry.split("|")]
+        if len(parts) != 3 or not all(parts):
+            raise ConfigurationError(
+                f"{name} entries must use member_openid|label|api_key"
+            )
+        member_openid, label, api_key = parts
+        if any(char.isspace() for char in member_openid + api_key):
+            raise ConfigurationError(f"{name} contains whitespace in an ID or key")
+        if member_openid in seen:
+            raise ConfigurationError(f"{name} repeats member {member_openid}")
+        seen.add(member_openid)
+        accounts.append(GPTUsageAccountConfig(member_openid, label, api_key))
+    return tuple(accounts)
 
 
 def _integer(

@@ -10,6 +10,8 @@ from botpy.http import Route
 from aiqq.interfaces.qq.commands import (
     GPT_IMAGE_COMMAND,
     MENU_COMMAND,
+    NAI_V5_IMAGE_COMMAND,
+    NAI_V5_STYLE_COMMAND,
     NOVELAI_IMAGE_COMMAND,
     NOVELAI_PROMPT_COMMAND,
     NOVELAI_QUICK_IMAGE_COMMAND,
@@ -22,6 +24,8 @@ PANEL_REMARK = "AiQQ 群聊指令面板"
 LEGACY_CLEAR_MEMORY_COMMAND = "清除记忆"
 MANAGED_COMMANDS = {
     MENU_COMMAND,
+    NAI_V5_IMAGE_COMMAND,
+    NAI_V5_STYLE_COMMAND,
     NOVELAI_PROMPT_COMMAND,
     NOVELAI_QUICK_IMAGE_COMMAND,
     NOVELAI_IMAGE_COMMAND,
@@ -41,9 +45,10 @@ def command_items() -> list[dict[str, Any]]:
     return [
         _item(MENU_COMMAND, "打开机器人快捷功能菜单"),
         _item(NOVELAI_PROMPT_COMMAND, "将画面描述转换为生图提示词"),
-        _item(NOVELAI_QUICK_IMAGE_COMMAND, "生成提示词后直接开始作画"),
         _item(NOVELAI_IMAGE_COMMAND, "输入提示词生成图片"),
-        _item(NOVELAI_STYLE_COMMAND, "设置个人画风，留空发送可清除"),
+        _item(NAI_V5_IMAGE_COMMAND, "使用 NovelAI V5 生成图片"),
+        _item(NOVELAI_STYLE_COMMAND, "设置原版独立画风，留空可清除"),
+        _item(NAI_V5_STYLE_COMMAND, "设置 v5 独立画风，留空可清除"),
     ]
 
 

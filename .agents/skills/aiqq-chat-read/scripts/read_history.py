@@ -1,4 +1,4 @@
-"""Read full same-group records using a stable cursor or exact filters."""
+"""Read compact same-group records, with explicit raw diagnostics on demand."""
 
 import argparse
 
@@ -6,7 +6,7 @@ from _bridge import read
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Read complete saved messages from this group")
+    parser = argparse.ArgumentParser(description="Read saved messages from this group")
     parser.add_argument("--before-record-id", type=int)
     parser.add_argument("--record-id", type=int)
     parser.add_argument("--message-id")
@@ -19,6 +19,7 @@ def main() -> None:
     parser.add_argument("--before-version-id", type=int)
     parser.add_argument("--events", action="store_true", default=None)
     parser.add_argument("--before-event-record-id", type=int)
+    parser.add_argument("--raw", action="store_true", default=None)
     arguments = vars(parser.parse_args())
     read("history", {key: value for key, value in arguments.items() if value is not None})
 

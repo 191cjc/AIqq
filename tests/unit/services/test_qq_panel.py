@@ -16,6 +16,14 @@ class FakeHTTP:
 
 
 class QQPanelTests(unittest.IsolatedAsyncioTestCase):
+    def test_public_panel_exposes_both_styles_with_short_descriptions(self):
+        names = [item["name"] for item in command_items()]
+        self.assertEqual(len(names), 6)
+        self.assertEqual(set(names), {
+            "菜单", "NovelAI提示词", "NovelAI生图", "Nai v5 作图", "NovelAI画风", "Nai v5 画风",
+        })
+        self.assertTrue(all(len(item["desc"]) <= 20 for item in command_items()))
+
     async def test_managed_panel_removes_legacy_commands(self):
         http = FakeHTTP(
             [
@@ -27,6 +35,12 @@ class QQPanelTests(unittest.IsolatedAsyncioTestCase):
                         "items": [
                             {
                                 "type": "command",
+                                "name": "菜单",
+                                "desc": "old",
+                                "only_admin": False,
+                            },
+                            {
+                                "type": "command",
                                 "name": "清除记忆",
                                 "desc": "old",
                                 "only_admin": False,
@@ -34,6 +48,12 @@ class QQPanelTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "type": "command",
                                 "name": "GPT生图",
+                                "desc": "old",
+                                "only_admin": False,
+                            },
+                            {
+                                "type": "command",
+                                "name": "NovelAI快速生图",
                                 "desc": "old",
                                 "only_admin": False,
                             },
@@ -50,18 +70,17 @@ class QQPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated, command_items())
         self.assertNotIn("清除记忆", str(updated))
         self.assertNotIn("GPT生图", str(updated))
+        self.assertNotIn("NovelAI快速生图", str(updated))
         self.assertEqual(
             [item["name"] for item in updated].count("NovelAI画风"), 1
-        )
-        self.assertEqual(
-            [item["name"] for item in updated].count("NovelAI快速生图"), 1
         )
         style = next(item for item in updated if item["name"] == "NovelAI画风")
         self.assertFalse(style["only_admin"])
         self.assertIn("清除", style["desc"])
-        quick = next(item for item in updated if item["name"] == "NovelAI快速生图")
-        self.assertFalse(quick["only_admin"])
-        self.assertIn("直接", quick["desc"])
+        v5_style = next(item for item in updated if item["name"] == "Nai v5 画风")
+        self.assertFalse(v5_style["only_admin"])
+        self.assertIn("独立", v5_style["desc"])
+        self.assertIn("清除", v5_style["desc"])
 
     async def test_matching_panel_is_not_rewritten(self):
         http = FakeHTTP(
@@ -96,6 +115,8 @@ class QQPanelTests(unittest.IsolatedAsyncioTestCase):
                 "items": [
                     *retained,
                     {"type": "command", "name": "NovelAI画风", "desc": "old"},
+                    {"type": "command", "name": "Nai v5 画风", "desc": "old"},
+                    {"type": "command", "name": "Nai v5 画风", "desc": "duplicate"},
                     {"type": "command", "name": "NovelAI快速生图", "desc": "old"},
                     {"type": "command", "name": "NovelAI快速生图", "desc": "duplicate"},
                     {"type": "command", "name": "GPT生图", "desc": "legacy"},
@@ -115,7 +136,10 @@ class QQPanelTests(unittest.IsolatedAsyncioTestCase):
             [item["name"] for item in updated["items"]].count("NovelAI画风"), 1
         )
         self.assertEqual(
-            [item["name"] for item in updated["items"]].count("NovelAI快速生图"), 1
+            [item["name"] for item in updated["items"]].count("NovelAI快速生图"), 0
+        )
+        self.assertEqual(
+            [item["name"] for item in updated["items"]].count("Nai v5 画风"), 1
         )
         record["panel"] = updated
         self.assertEqual((await service.sync()).action, "unchanged")

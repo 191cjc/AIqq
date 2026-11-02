@@ -21,6 +21,7 @@ from aiqq.exceptions import InvalidAgentOutput
 from aiqq.logic.models import (
     MAX_GPT_IMAGE_DIMENSION,
     MAX_GPT_IMAGE_PIXELS,
+    MAX_REPLY_IMAGES,
     MIN_GPT_IMAGE_DIMENSION,
     ChatAgentOutput,
     ImageAction,
@@ -67,8 +68,6 @@ class _PromptAuditOutput(_StrictOutput):
         "safe",
         "adult_content",
         "persona_override",
-        "complex_research",
-        "too_many_questions",
         "too_complex",
     ]
     reason: str = Field(max_length=300)
@@ -126,7 +125,7 @@ class _ChatOutput(_StrictOutput):
     full_text: NonEmptyText
     summary: SummaryText
     image_action: _ImageActionOutput | None
-    selected_web_image_url: UrlText | None
+    selected_web_image_urls: list[UrlText] = Field(max_length=MAX_REPLY_IMAGES)
     sources: list[_SourceOutput] = Field(max_length=3)
 
     @field_validator("summary")
@@ -138,10 +137,10 @@ class _ChatOutput(_StrictOutput):
             raise ValueError("summary cannot contain links, Markdown, or machine markers")
         return value
 
-    @field_validator("selected_web_image_url")
+    @field_validator("selected_web_image_urls")
     @classmethod
-    def validate_image_url(cls, value: str | None) -> str | None:
-        return None if value is None else _validate_public_https_url(value)
+    def validate_image_urls(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(_validate_public_https_url(value) for value in values))
 
 
 class _ImagePromptAuditOutput(_StrictOutput):
@@ -278,7 +277,7 @@ def parse_chat_agent_output(
         full_text=value.full_text,
         summary=value.summary,
         image_action=image_action,
-        selected_web_image_url=value.selected_web_image_url,
+        selected_web_image_urls=tuple(value.selected_web_image_urls),
         sources=tuple(SourceReference(item.title, item.url) for item in value.sources),
     )
 

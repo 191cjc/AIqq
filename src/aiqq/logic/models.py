@@ -11,8 +11,6 @@ PromptAuditCategory = Literal[
     "safe",
     "adult_content",
     "persona_override",
-    "complex_research",
-    "too_many_questions",
     "too_complex",
 ]
 ImageActionMode = Literal["generate", "edit"]
@@ -24,6 +22,7 @@ DEFAULT_GPT_IMAGE_SIZE: GPTImageSize = "1024x1024"
 MIN_GPT_IMAGE_DIMENSION = 256
 MAX_GPT_IMAGE_DIMENSION = 2048
 MAX_GPT_IMAGE_PIXELS = 4_194_304
+MAX_REPLY_IMAGES = 5
 GPT_IMAGE_DIMENSIONS: Mapping[GPTImageSize, tuple[int, int]] = MappingProxyType(
     {
         "1024x1024": (1024, 1024),
@@ -110,6 +109,9 @@ class GroupHistoryMessage:
     message_type: int | None = None
     reply_summary: str = ""
     has_image: bool = False
+    image_attachment_indexes: tuple[int, ...] = ()
+    recall_state: str = "unobserved"
+    progress: bool = False
     record: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -117,6 +119,41 @@ class GroupHistoryMessage:
             raise ValueError("history record ID must be positive")
         if not self.sent_at:
             raise ValueError("history timestamp must not be empty")
+
+
+def compact_chat_record(
+    message: GroupHistoryMessage | None,
+    *,
+    content: str | None = None,
+) -> dict[str, Any]:
+    """Serialize the stable semantic record used in model-facing chat context."""
+    if message is None:
+        return {
+            "record_id": None,
+            "role": "user",
+            "sender_name": None,
+            "sent_at": None,
+            "content": content or "",
+            "message_type": None,
+            "reply_summary": "",
+            "has_image": False,
+            "image_attachment_indexes": [],
+            "recall_state": "unobserved",
+            "progress": False,
+        }
+    return {
+        "record_id": message.record_id,
+        "role": message.role,
+        "sender_name": message.sender_name,
+        "sent_at": message.sent_at,
+        "content": message.content if content is None else content,
+        "message_type": message.message_type,
+        "reply_summary": message.reply_summary,
+        "has_image": message.has_image,
+        "image_attachment_indexes": list(message.image_attachment_indexes),
+        "recall_state": message.recall_state,
+        "progress": message.progress,
+    }
 
 
 @dataclass(frozen=True)
@@ -227,7 +264,7 @@ class ChatAgentOutput:
     summary: str
     image_action: ImageAction | None = None
     generated_images: tuple[ImageAsset, ...] = ()
-    selected_web_image_url: str | None = None
+    selected_web_image_urls: tuple[str, ...] = ()
     sources: tuple[SourceReference, ...] = ()
 
     def __post_init__(self) -> None:
@@ -237,6 +274,8 @@ class ChatAgentOutput:
             raise ValueError("chat summary must contain 1 to 50 characters")
         if len(self.generated_images) > 1:
             raise ValueError("chat output supports at most one generated image")
+        if len(self.selected_web_image_urls) > MAX_REPLY_IMAGES:
+            raise ValueError(f"chat output supports at most {MAX_REPLY_IMAGES} web images")
         if len(self.sources) > 3:
             raise ValueError("chat output supports at most three sources")
 
@@ -250,14 +289,15 @@ class ConversationResult:
     sources: tuple[SourceReference, ...] = ()
     error_code: str | None = None
     image_provenance: Mapping[str, Any] = field(default_factory=dict)
+    generation_prompt: str | None = None
 
     def __post_init__(self) -> None:
         if not self.full_text.strip():
             raise ValueError("conversation result must include display text")
         if not 1 <= len(self.summary.strip()) <= 50:
             raise ValueError("conversation summary must contain 1 to 50 characters")
-        if len(self.images) > 1:
-            raise ValueError("conversation result supports at most one image")
+        if len(self.images) > MAX_REPLY_IMAGES:
+            raise ValueError(f"conversation result supports at most {MAX_REPLY_IMAGES} images")
         if len(self.sources) > 3:
             raise ValueError("conversation result supports at most three sources")
         if self.status == "ok" and self.error_code is not None:

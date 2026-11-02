@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from .commands import (
+    GPT_USAGE_COMMAND,
     MENU_COMMAND,
+    NAI_V5_IMAGE_COMMAND,
+    NAI_V5_STYLE_COMMAND,
     NOVELAI_IMAGE_COMMAND,
     NOVELAI_PROMPT_COMMAND,
     NOVELAI_PROMPT_EDIT_COMMAND,
@@ -13,7 +16,11 @@ from .commands import (
 )
 
 
-def quick_menu_keyboard(*, full_reply_url: str | None = None) -> dict[str, Any]:
+def quick_menu_keyboard(
+    *, full_reply_url: str | None = None,
+    generation_prompt_url: str | None = None,
+    image_url: str | None = None,
+) -> dict[str, Any]:
     rows = [
         _command_row(
             button_id="open_feature_menu",
@@ -24,6 +31,14 @@ def quick_menu_keyboard(*, full_reply_url: str | None = None) -> dict[str, Any]:
     ]
     if full_reply_url:
         rows.append(_link_row(full_reply_url))
+    if generation_prompt_url:
+        rows.append(_link_row(
+            generation_prompt_url,
+            button_id="view_generation_prompt",
+            label="查看本次提示词",
+        ))
+    if image_url:
+        rows.append(_link_row(image_url, button_id="view_image", label="查看图片"))
     return {"content": {"rows": rows}}
 
 
@@ -42,10 +57,31 @@ def feature_menu_keyboard() -> dict[str, Any]:
                     command=NOVELAI_IMAGE_COMMAND,
                 ),
                 _command_row(
+                    button_id="nai_v5_image",
+                    label=NAI_V5_IMAGE_COMMAND,
+                    command=NAI_V5_IMAGE_COMMAND,
+                ),
+                _command_row(
                     button_id="novelai_style",
                     label=NOVELAI_STYLE_COMMAND,
                     command=NOVELAI_STYLE_COMMAND,
                 ),
+                # QQ keyboards allow at most five rows; share the last one.
+                {
+                    "buttons": [
+                        *_command_row(
+                            button_id="nai_v5_style",
+                            label=NAI_V5_STYLE_COMMAND,
+                            command=NAI_V5_STYLE_COMMAND,
+                        )["buttons"],
+                        *_command_row(
+                            button_id="gpt_usage",
+                            label=GPT_USAGE_COMMAND,
+                            command=GPT_USAGE_COMMAND,
+                            enter=True,
+                        )["buttons"],
+                    ]
+                },
             ]
         }
     }
@@ -100,14 +136,16 @@ def _command_row(
     }
 
 
-def _link_row(url: str) -> dict[str, Any]:
+def _link_row(
+    url: str, *, button_id: str = "view_full_reply", label: str = "查看完整输出"
+) -> dict[str, Any]:
     return {
         "buttons": [
             {
-                "id": "view_full_reply",
+                "id": button_id,
                 "render_data": {
-                    "label": "查看完整输出",
-                    "visited_label": "查看完整输出",
+                    "label": label,
+                    "visited_label": label,
                     "style": 1,
                 },
                 "action": {

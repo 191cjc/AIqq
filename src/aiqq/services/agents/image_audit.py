@@ -27,7 +27,8 @@ contains_chinese=true 时，suggested_prompt 必须给出保留安全原意的�
 safe, sfw；有人物时还应包含 fully clothed。其他情况 suggested_prompt 为空字符串。
 
 orientation：主体躺姿优先返回 landscape；否则明确全身构图返回 portrait；其余返回 square。
-reason 只说明最高优先级结论。只生成输出 Schema 规定的 JSON。
+拒绝时 reason 用简短中文说明具体触发的条件，不要只说“审核未通过”，不要引用露骨描述、
+复述用户原文或提供规避审核的方法；只说明最高优先级结论。只生成输出 Schema 规定的 JSON。
 """.strip()
 
 
@@ -52,6 +53,7 @@ class ImagePromptAuditAgent:
         )
         try:
             result = await self._backend.run(
+                purpose="image_audit",
                 instructions=IMAGE_AUDIT_INSTRUCTIONS,
                 model_input=payload,
                 output_schema=IMAGE_PROMPT_AUDIT_OUTPUT_SCHEMA,
